@@ -1,6 +1,7 @@
 package file
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"gorm.io/gorm"
+
+	"netdisk/pkg/httpx"
 )
 
 const (
@@ -32,6 +35,8 @@ func RegisterRoutes(g *echo.Group, db *gorm.DB) {
 
 func upload(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		ctx := c.Request().Context()
+
 		header, err := c.FormFile("file")
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "缺少上传文件字段 file"})
@@ -49,7 +54,7 @@ func upload(db *gorm.DB) echo.HandlerFunc {
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 parent_id"})
 		}
-		if err := checkParent(db, ownerID, parentID); err != nil {
+		if err := checkParent(ctx, db, ownerID, parentID); err != nil {
 			return writeParentCheckError(c, err)
 		}
 
@@ -80,8 +85,8 @@ func upload(db *gorm.DB) echo.HandlerFunc {
 			StorageKey: storageKey,
 			Status:     StatusNormal,
 		}
-		if err := db.Create(&f).Error; err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "写入文件记录失败"})
+		if err := gorm.G[File](db).Create(ctx, &f); err != nil {
+			return httpx.Fail(c, err, "写入文件记录失败")
 		}
 
 		return c.JSON(http.StatusCreated, f)
@@ -117,13 +122,16 @@ var errParentInvalid = errors.New("父目录不存在或不是可用目录")
 // checkParent 校验 parentID 是否可作为 ownerID 下新条目的父级。
 // parentID 为 0 表示根目录，直接通过；非 0 时该记录必须存在、
 // 属于同一 owner、是目录(而非文件)、且状态正常。
-func checkParent(db *gorm.DB, ownerID, parentID uint64) error {
+//
+// ctx 之所以当第一个参数传进来（而不是存进某个结构体），是 Go 的官方约定：
+// 取消信号与超时必须沿调用链传递，谁都不能私自"记住"它。
+func checkParent(ctx context.Context, db *gorm.DB, ownerID, parentID uint64) error {
 	if parentID == 0 {
 		return nil
 	}
 
-	var parent File
-	if err := db.First(&parent, parentID).Error; err != nil {
+	parent, err := gorm.G[File](db).Where("id = ?", parentID).First(ctx)
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return errParentInvalid
 		}
@@ -141,22 +149,26 @@ func writeParentCheckError(c *echo.Context, err error) error {
 	if errors.Is(err, errParentInvalid) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
-	return c.JSON(http.StatusInternalServerError, map[string]string{"error": "校验父目录失败"})
+	return httpx.Fail(c, err, "校验父目录失败")
 }
 
 func download(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		ctx := c.Request().Context()
+
 		id, err := strconv.ParseUint(c.Param("id"), 10, 64)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的文件 id"})
 		}
 
-		var f File
-		if err := db.First(&f, id).Error; err != nil {
+		// 泛型 First 直接返回 (T, error)，不用先声明变量再传指针进去。
+		// 查不到时错误仍是 gorm.ErrRecordNotFound，判断方式不变。
+		f, err := gorm.G[File](db).Where("id = ?", id).First(ctx)
+		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不存在"})
 			}
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "查询文件失败"})
+			return httpx.Fail(c, err, "查询文件失败")
 		}
 		// 目录、回收站里的文件都不提供下载。
 		if f.Type != TypeFile || f.Status != StatusNormal || f.StorageKey == "" {
@@ -187,12 +199,17 @@ func download(db *gorm.DB) echo.HandlerFunc {
 
 func list(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		ctx := c.Request().Context()
+
 		ownerID, err := parseOptionalUint(c.QueryParam("owner_id"), defaultOwnerID)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 owner_id"})
 		}
 
-		q := db.Model(&File{}).Where("owner_id = ?", ownerID)
+		// gorm.G[File](db) 已经把模型类型固定住了，不用再写 Model(&File{})；
+		// 这里的 Where 返回 ChainInterface[File]，所以后续链式调用都必须
+		// 赋回同一个变量 q（GORM 的不可变链式，和经典 API 一致）。
+		q := gorm.G[File](db).Where("owner_id = ?", ownerID)
 
 		// 不带 parent_id 表示"该用户的全部文件"；带上就只看这个目录的直接子项。
 		if raw := strings.TrimSpace(c.QueryParam("parent_id")); raw != "" {
@@ -223,15 +240,15 @@ func list(db *gorm.DB) echo.HandlerFunc {
 		}
 		offset := parseUintOr(c.QueryParam("offset"), 0)
 
-		// 用 make([]File, 0) 而不是 var items []File：后者在没查到数据时是 nil，
-		// 序列化成 JSON 会变成 null，前端得多写一层判空。
-		items := make([]File, 0)
-		err = q.Order("type DESC, name ASC"). // 目录(2) 排在文件(1) 前面
-							Limit(int(limit)).
-							Offset(int(offset)).
-							Find(&items).Error
+		// 泛型 Find 直接返回 []File。GORM 在 scan 阶段会把目标切片
+		// 初始化成长度 0 的非 nil 切片，所以查不到数据时序列化出来就是
+		// []，不需要自己 make（实测确认过）。
+		items, err := q.Order("type DESC, name ASC"). // 目录(2) 排在文件(1) 前面
+								Limit(int(limit)).
+								Offset(int(offset)).
+								Find(ctx)
 		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "查询文件列表失败"})
+			return httpx.Fail(c, err, "查询文件列表失败")
 		}
 
 		return c.JSON(http.StatusOK, map[string]any{
@@ -251,6 +268,8 @@ type createDirRequest struct {
 
 func createDir(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		ctx := c.Request().Context()
+
 		var req createDirRequest
 		if err := c.Bind(&req); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
@@ -264,19 +283,19 @@ func createDir(db *gorm.DB) echo.HandlerFunc {
 		if ownerID == 0 {
 			ownerID = defaultOwnerID
 		}
-		if err := checkParent(db, ownerID, req.ParentID); err != nil {
+		if err := checkParent(ctx, db, ownerID, req.ParentID); err != nil {
 			return writeParentCheckError(c, err)
 		}
 
 		// 同级不允许重名：否则列表里会出现一堆看不出区别的同名目录。
 		// 把文件也算进来，避免"同名文件和目录共存"这种更麻烦的情况。
-		var sameName int64
-		err := db.Model(&File{}).
+		// 泛型 Count 返回 (int64, error)，不用再传 &sameName 进去。
+		sameName, err := gorm.G[File](db).
 			Where("owner_id = ? AND parent_id = ? AND name = ? AND status <> ?",
 				ownerID, req.ParentID, req.Name, StatusDeleted).
-			Count(&sameName).Error
+			Count(ctx, "*")
 		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "检查同名条目失败"})
+			return httpx.Fail(c, err, "检查同名条目失败")
 		}
 		if sameName > 0 {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "同级下已存在同名文件或目录"})
@@ -289,8 +308,8 @@ func createDir(db *gorm.DB) echo.HandlerFunc {
 			ParentID: req.ParentID,
 			OwnerID:  ownerID,
 		}
-		if err := db.Create(&f).Error; err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "创建目录失败"})
+		if err := gorm.G[File](db).Create(ctx, &f); err != nil {
+			return httpx.Fail(c, err, "创建目录失败")
 		}
 		return c.JSON(http.StatusCreated, f)
 	}

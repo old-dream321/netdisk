@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/labstack/echo/v5 v5.4.0
+	golang.org/x/crypto v0.57.0
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.2
 )

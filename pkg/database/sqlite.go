@@ -6,7 +6,12 @@ import (
 )
 
 func NewSQLiteDB(dsn string) (*gorm.DB, error) {
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		// 让 GORM 把驱动的原生错误翻译成统一的语义化错误，
+		// 例如 SQLite 的 "UNIQUE constraint failed" → gorm.ErrDuplicatedKey。
+		// 这样业务代码可以用 errors.Is 判断，而不用去匹配错误字符串。
+		TranslateError: true,
+	})
 	if err != nil {
 		return nil, err
 	}
