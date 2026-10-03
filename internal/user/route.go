@@ -19,15 +19,13 @@ import (
 const (
 	// defaultQuota 新用户的默认配额：1GiB。
 	defaultQuota int64 = 1 << 30
-	// minPasswordLen 密码最小长度（按字节算；纯 ASCII 时等价于字符数）。
-	minPasswordLen = 8
 	// maxUsernameLen 用户名最大长度（按 rune 算，避免中文被按字节"缩短"）。
 	maxUsernameLen = 64
 )
 
 func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store) {
 	// 注册、登录是公开的。
-	g.POST("", register(db))
+	g.POST("/register", register(db))
 	g.POST("/login", login(db, sessions))
 
 	// 登出、查当前用户需要登录：逐条挂上鉴权中间件。
@@ -61,9 +59,6 @@ func validateUsername(name string) error {
 	return nil
 }
 
-// validateEmail 只做最基本的检查：非空、不含空白、包含 @。
-// 完整的邮箱校验（RFC 5322）是个大坑，等真的需要发验证邮件时
-// 再用 net/mail.ParseAddress，或者干脆靠"发信验证"来证明邮箱有效。
 func validateEmail(email string) error {
 	if email == "" {
 		return errors.New("邮箱不能为空")
@@ -77,11 +72,7 @@ func validateEmail(email string) error {
 	return nil
 }
 
-// validatePassword 长度上下限：下限是基本强度要求，上限来自 bcrypt 的硬限制。
 func validatePassword(password string) error {
-	if len(password) < minPasswordLen {
-		return fmt.Errorf("密码至少 %d 位", minPasswordLen)
-	}
 	if len(password) > maxPasswordBytes {
 		return fmt.Errorf("密码不能超过 %d 字节", maxPasswordBytes)
 	}
@@ -97,8 +88,6 @@ func register(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
 		}
 
-		// 逐个字段校验并各自给出原因：合并成一句"用户名和密码不能为空"，
-		// 调用方根本不知道自己到底漏了哪个。
 		if err := validateUsername(req.Username); err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
@@ -169,7 +158,6 @@ func login(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
 		u, err := gorm.G[User](db).Where("username = ?", req.Username).First(ctx)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// 故意和"密码错误"回同一句话，否则这个接口就成了用户名枚举器。
 				return errBadCredentials(c)
 			}
 			return httpx.Fail(c, err, "查询用户失败")
@@ -211,8 +199,6 @@ func setSessionCookie(c *echo.Context, token string, expires time.Time) {
 
 func logout(sessions session.Store) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		// token 由鉴权中间件放进上下文，这里不用再解析一遍 cookie。
-		// Delete 是幂等的，重复登出不报错。
 		if err := sessions.Delete(c.Request().Context(), auth.Token(c)); err != nil {
 			return httpx.Fail(c, err, "注销会话失败")
 		}
@@ -243,6 +229,10 @@ func me(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
 				return c.JSON(http.StatusUnauthorized, map[string]string{"error": "用户不存在"})
 			}
 			return httpx.Fail(c, err, "查询用户失败")
+		}
+
+		if used, err := RefreshUsed(ctx, db, uint64(u.ID)); err == nil {
+			u.Used = used
 		}
 
 		return c.JSON(http.StatusOK, u)

@@ -1,48 +1,126 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
+const DefaultConfigFile = "config.yaml"
+
 type Config struct {
-	Addr        string
-	DatabaseDSN string
-	StorageDir  string        // 文件内容存放的根目录
-	SessionFile string        // 会话存储文件（Redis 的临时替身）
-	SessionTTL  time.Duration // 登录态有效期
+	Server   ServerConfig   `yaml:"server"`
+	Database DatabaseConfig `yaml:"database"`
+	Storage  StorageConfig  `yaml:"storage"`
+	Session  SessionConfig  `yaml:"session"`
+	Trash    TrashConfig    `yaml:"trash"`
 }
 
-func Load() Config {
+type ServerConfig struct {
+	Addr string `yaml:"addr"`
+}
+
+type DatabaseConfig struct {
+	DSN string `yaml:"dsn"`
+}
+
+type StorageConfig struct {
+	Dir string `yaml:"dir"`
+}
+
+type SessionConfig struct {
+	File string        `yaml:"file"`
+	TTL  time.Duration `yaml:"ttl"`
+}
+
+// TrashConfig 控制后台清理：进了回收站的条目躺够 TTL，就被彻底删除。
+type TrashConfig struct {
+	// 回收站里的保留时长
+	TTL time.Duration `yaml:"ttl"`
+	// 扫描间隔。
+	Sweep time.Duration `yaml:"sweep"`
+}
+
+// Default 返回内置的默认配置。
+func Default() Config {
 	return Config{
-		Addr:        env("NETDISK_ADDR", ":1323"),
-		DatabaseDSN: env("NETDISK_DSN", "data/db"),
-		StorageDir:  env("NETDISK_STORAGE", "data/files"),
-		SessionFile: env("NETDISK_SESSION_FILE", "data/sessions.json"),
-		SessionTTL:  envDuration("NETDISK_SESSION_TTL", 7*24*time.Hour),
+		Server:   ServerConfig{Addr: ":8080"},
+		Database: DatabaseConfig{DSN: "data"},
+		Storage:  StorageConfig{Dir: "storage"},
+		Session:  SessionConfig{File: "sessions.json", TTL: 24 * time.Hour},
+		Trash:    TrashConfig{TTL: 30 * 24 * time.Hour, Sweep: time.Hour},
 	}
 }
 
-func env(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
+func Load() (Config, error) {
+	f, err := os.Open(DefaultConfigFile)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return Config{}, fmt.Errorf("打开配置文件 %s: %w", DefaultConfigFile, err)
+		}
+
+		cfg := Default()
+		if err := saveConfig(cfg); err != nil {
+			log.Printf("无法生成默认配置文件（将只使用内置默认值）: %v", err)
+		} else {
+			log.Printf("已生成默认配置文件 %s，修改后重启即可生效", DefaultConfigFile)
+		}
+		return cfg, nil
 	}
-	return fallback
+	defer f.Close()
+
+	var cfg Config
+	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {
+		return Config{}, fmt.Errorf("解析配置文件 %s: %w", DefaultConfigFile, err)
+	}
+	cfg.normalize()
+	return cfg, nil
 }
 
-// envDuration 解析 "30m" / "168h" 这类时长；写错了就退回默认值并打印提示，
-// 而不是让服务起不来。
-func envDuration(key string, fallback time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
+func (c *Config) normalize() {
+	def := Default()
+	if c.Server.Addr == "" {
+		c.Server.Addr = def.Server.Addr
 	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		log.Printf("环境变量 %s=%q 不是合法时长，使用默认值 %s", key, raw, fallback)
-		return fallback
+	if c.Database.DSN == "" {
+		c.Database.DSN = def.Database.DSN
 	}
-	return d
+	if c.Storage.Dir == "" {
+		c.Storage.Dir = def.Storage.Dir
+	}
+	if c.Session.File == "" {
+		c.Session.File = def.Session.File
+	}
+	if c.Session.TTL <= 0 {
+		log.Printf("session.ttl 未设置或不是正数，使用默认值 %s", def.Session.TTL)
+		c.Session.TTL = def.Session.TTL
+	}
+	if c.Trash.TTL <= 0 {
+		log.Printf("trash.ttl 未设置或不是正数，使用默认值 %s", def.Trash.TTL)
+		c.Trash.TTL = def.Trash.TTL
+	}
+	if c.Trash.Sweep <= 0 {
+		log.Printf("trash.sweep 未设置或不是正数，使用默认值 %s", def.Trash.Sweep)
+		c.Trash.Sweep = def.Trash.Sweep
+	}
+}
+
+func saveConfig(cfg Config) error {
+	f, err := os.Create(DefaultConfigFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	encoder := yaml.NewEncoder(f)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(cfg); err != nil {
+		return err
+	}
+
+	return nil
 }

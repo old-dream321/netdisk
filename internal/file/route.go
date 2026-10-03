@@ -4,16 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v5"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"netdisk/internal/auth"
+	"netdisk/internal/user"
 	"netdisk/pkg/httpx"
 	"netdisk/pkg/session"
 )
@@ -26,20 +29,21 @@ const (
 	maxPageSize     = 1000
 )
 
-func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store) {
-	// 整个 files 组都要求登录：挂在组上，组里新增的接口自动受保护。
+func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store, storageDir string) {
 	g = g.Group("", auth.RequireLogin(sessions))
 
-	g.GET("", list(db))
-	g.POST("/upload", upload(db))
+	g.POST("/list", list(db)) // 列表：POST + JSON body
+	g.POST("/upload", upload(db, storageDir))
 	g.POST("/createdir", createDir(db))
-	g.GET("/:id/download", download(db))
-	g.PATCH("/:id", update(db))         // 改名 / 移动
-	g.DELETE("/:id", remove(db))        // 默认软删除（进回收站），?permanent=true 为彻底删除
-	g.POST("/:id/restore", restore(db)) // 从回收站恢复（目录连同子项）
+	g.GET("/:id/download", download(db, storageDir))
+	// HEAD 和 GET 共用同一个 handler。http.ServeContent 自己认得 HEAD，很神奇（
+	g.HEAD("/:id/download", download(db, storageDir))
+	g.PATCH("/:id", update(db))              // 改名 / 移动
+	g.DELETE("/:id", remove(db, storageDir)) // 默认软删除（进回收站），?permanent=true 为彻底删除
+	g.POST("/:id/restore", restore(db))      // 从回收站恢复
 }
 
-func upload(db *gorm.DB) echo.HandlerFunc {
+func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		ownerID := auth.UserID(c)
@@ -50,6 +54,15 @@ func upload(db *gorm.DB) echo.HandlerFunc {
 		}
 		if header.Size > maxUploadSize {
 			return c.JSON(http.StatusRequestEntityTooLarge, map[string]string{"error": "文件超过大小限制"})
+		}
+
+		// 配额预检查放在最前面：此刻还没落盘，被拒时不需要清理任何东西。
+		// 用 header.Size（multipart 解析出来的真实长度）而不是客户端报的数字。
+		if err := user.EnsureCapacity(ctx, db, ownerID, header.Size); err != nil {
+			if errors.Is(err, user.ErrQuotaExceeded) {
+				return c.JSON(http.StatusInsufficientStorage, map[string]string{"error": err.Error()})
+			}
+			return httpx.Fail(c, err, "检查配额失败")
 		}
 
 		// 元数据先校验完再落盘：一次注定失败的请求不该白写一遍磁盘。
@@ -84,7 +97,7 @@ func upload(db *gorm.DB) echo.HandlerFunc {
 		defer src.Close()
 
 		// 内容先落盘，再做记录，避免出现「有记录没文件」。
-		storageKey, size, hash, err := saveUpload(src)
+		storageKey, size, hash, err := saveUpload(storageDir, src)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "保存文件失败"})
 		}
@@ -103,11 +116,16 @@ func upload(db *gorm.DB) echo.HandlerFunc {
 			return httpx.Fail(c, err, "写入文件记录失败")
 		}
 
+		// 刷新用量缓存（/me 显示的数字）。失败只影响展示，不该让上传失败。
+		if _, err := user.RefreshUsed(ctx, db, ownerID); err != nil {
+			log.Printf("刷新用户 %d 的用量失败: %v", ownerID, err)
+		}
+
 		return c.JSON(http.StatusCreated, f)
 	}
 }
 
-// parseOptionalUint 解析"引用型"的可选整数（parent_id / status）：
+// parseOptionalUint 解析表单里"引用型"的可选整数（parent_id）：
 // 缺省时返回 fallback，填了但不合法则返回错误。这类值静默回退很危险——
 // parent_id 写错会被塞进根目录，用户完全察觉不到。
 func parseOptionalUint(raw string, fallback uint64) (uint64, error) {
@@ -116,16 +134,6 @@ func parseOptionalUint(raw string, fallback uint64) (uint64, error) {
 		return fallback, nil
 	}
 	return strconv.ParseUint(raw, 10, 64)
-}
-
-// parseUintOr 解析"数值旋钮"（limit / offset）：不合法就用 fallback，
-// 为了一个分页参数报错、让前端多写一堆错误处理，不值得。
-func parseUintOr(raw string, fallback uint64) uint64 {
-	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
-	if err != nil {
-		return fallback
-	}
-	return v
 }
 
 // errParentInvalid 是父目录校验失败的统一错误。
@@ -188,7 +196,7 @@ func nameTaken(ctx context.Context, db *gorm.DB, ownerID, parentID uint64, name 
 // errNameTaken 是同名冲突的统一错误，upload / createdir / restore / update 共用。
 var errNameTaken = errors.New("同级下已存在同名文件或目录")
 
-func download(db *gorm.DB) echo.HandlerFunc {
+func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		ownerID := auth.UserID(c)
@@ -198,8 +206,6 @@ func download(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的文件 id"})
 		}
 
-		// 归属条件直接写进 WHERE：别人的文件一律"查不到"。
-		// 不用 403 区分，是为了不泄露"这个 id 确实存在"。
 		f, err := gorm.G[File](db).Where("id = ? AND owner_id = ?", id, ownerID).First(ctx)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -212,7 +218,7 @@ func download(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不可用"})
 		}
 
-		src, err := os.Open(objectPath(f.StorageKey))
+		src, err := os.Open(objectPath(storageDir, f.StorageKey))
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取文件内容失败"})
 		}
@@ -234,48 +240,63 @@ func download(db *gorm.DB) echo.HandlerFunc {
 	}
 }
 
+// listRequest 是列表的查询条件。
+//
+// 用指针是为了区分"没传"和"传了零值"：
+//   - ParentID 为 nil = 该用户的全部文件；为 0 = 只看根目录；
+//   - Status 为 nil = 只看正常文件（1），传 2 就是看回收站。
+type listRequest struct {
+	ParentID *uint64 `json:"parent_id"`
+	Status   *int8   `json:"status"`
+	Limit    uint64  `json:"limit"`  // 0 = 用默认值（200）
+	Offset   uint64  `json:"offset"` // 0 = 从头开始
+}
+
 func list(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		ownerID := auth.UserID(c)
 
-		q := gorm.G[File](db).Where("owner_id = ?", ownerID)
-
-		// 不带 parent_id 表示"该用户的全部文件"；带上就只看这个目录的直接子项。
-		if raw := strings.TrimSpace(c.QueryParam("parent_id")); raw != "" {
-			parentID, err := parseOptionalUint(raw, 0)
-			if err != nil {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 parent_id"})
-			}
-			q = q.Where("parent_id = ?", parentID)
+		// 请求体可以整个省略，也可以只写关心的字段。
+		var req listRequest
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
 		}
 
-		// 默认只列正常文件，status=2 可以查看回收站。
+		// gorm.G[File](db) 已经把模型类型固定住了，不用再写 Model(&File{})；
+		// 这里的 Where 返回 ChainInterface[File]，所以后续链式调用都必须
+		// 赋回同一个变量 q（GORM 的不可变链式，和经典 API 一致）。
+		//
+		// owner_id 来自会话而不是客户端参数：这是"只看得到自己的文件"的关键。
+		q := gorm.G[File](db).Where("owner_id = ?", ownerID)
+
+		if req.ParentID != nil {
+			q = q.Where("parent_id = ?", *req.ParentID)
+		}
+
 		status := StatusNormal
-		if raw := strings.TrimSpace(c.QueryParam("status")); raw != "" {
-			v, err := parseOptionalUint(raw, uint64(StatusNormal))
-			if err != nil || v > uint64(StatusDeleted) {
+		if req.Status != nil {
+			if *req.Status < StatusNormal || *req.Status > StatusDeleted {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 status"})
 			}
-			status = int8(v)
+			status = *req.Status
 		}
 		q = q.Where("status = ?", status)
 
-		limit := parseUintOr(c.QueryParam("limit"), defaultPageSize)
+		limit := req.Limit
 		if limit == 0 {
 			limit = defaultPageSize
 		}
 		if limit > maxPageSize {
 			limit = maxPageSize
 		}
-		offset := parseUintOr(c.QueryParam("offset"), 0)
 
 		// 泛型 Find 直接返回 []File。GORM 在 scan 阶段会把目标切片
 		// 初始化成长度 0 的非 nil 切片，所以查不到数据时序列化出来就是
 		// []，不需要自己 make（实测确认过）。
 		items, err := q.Order("type DESC, name ASC"). // 目录(2) 排在文件(1) 前面
 								Limit(int(limit)).
-								Offset(int(offset)).
+								Offset(int(req.Offset)).
 								Find(ctx)
 		if err != nil {
 			return httpx.Fail(c, err, "查询文件列表失败")
@@ -285,7 +306,7 @@ func list(db *gorm.DB) echo.HandlerFunc {
 			"items":  items, // 本页数据
 			"count":  len(items),
 			"limit":  limit,
-			"offset": offset,
+			"offset": req.Offset,
 		})
 	}
 }
@@ -361,7 +382,8 @@ func removefile(ctx context.Context, db *gorm.DB, fileid uint64) error {
 	file.Status = StatusTrash
 	if _, err := gorm.G[File](db).
 		Where("id = ?", fileid).
-		Update(ctx, "status", file.Status); err != nil {
+		Set(clause.Assignments(map[string]any{"status": file.Status, "deleted_at": time.Now()})).
+		Update(ctx); err != nil {
 		return fmt.Errorf("更新状态: %w", err)
 	}
 	return nil
@@ -409,7 +431,8 @@ func restoreTree(ctx context.Context, db *gorm.DB, ownerID, id uint64) (int, err
 
 	n, err := gorm.G[File](db).
 		Where("id IN ? AND owner_id = ? AND status = ?", ids, ownerID, StatusTrash).
-		Update(ctx, "status", StatusNormal)
+		Set(clause.Assignments(map[string]any{"status": StatusNormal, "deleted_at": nil})).
+		Update(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("恢复状态: %w", err)
 	}
@@ -417,11 +440,7 @@ func restoreTree(ctx context.Context, db *gorm.DB, ownerID, id uint64) (int, err
 }
 
 // purgeTree 彻底删除 id 及其子孙：先删数据库记录，再清理不再被引用的磁盘对象。
-//
-// 顺序很重要。对象文件的操作不在数据库事务里：
-//   - 先删记录、后清对象：中途失败只会留下孤儿对象文件（无害，以后还能清）；
-//   - 反过来先删对象：一旦事务回滚，就留下"记录还在、内容没了"的坏数据。
-func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File) error {
+func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, storageDir string) error {
 	descendants, err := collectSubtree(ctx, db, ownerID, root.ID)
 	if err != nil {
 		return err
@@ -458,14 +477,20 @@ func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File) erro
 		if refs > 0 {
 			continue
 		}
-		if err := os.Remove(objectPath(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(objectPath(storageDir, key)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("删除对象文件: %w", err)
 		}
+	}
+
+	// 彻底删除才释放配额（回收站里的还占着），所以刷新一下用量缓存。
+	// 记录已经删了，这里失败只影响展示，不该让请求报错。
+	if _, err := user.RefreshUsed(ctx, db, ownerID); err != nil {
+		log.Printf("刷新用户 %d 的用量失败: %v", ownerID, err)
 	}
 	return nil
 }
 
-func remove(db *gorm.DB) echo.HandlerFunc {
+func remove(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 		ownerID := auth.UserID(c)
@@ -486,7 +511,7 @@ func remove(db *gorm.DB) echo.HandlerFunc {
 		// ?permanent=true 是彻底删除：记录和磁盘对象一起清掉，不可恢复。
 		// 不要求先经过回收站——它就是"直接全删"。
 		if c.QueryParam("permanent") == "true" {
-			if err := purgeTree(ctx, db, ownerID, file); err != nil {
+			if err := purgeTree(ctx, db, ownerID, file, storageDir); err != nil {
 				return httpx.Fail(c, err, "彻底删除失败")
 			}
 			return c.NoContent(http.StatusNoContent)

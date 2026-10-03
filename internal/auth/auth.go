@@ -1,7 +1,5 @@
 package auth
 
-// 本包只负责一件事：从 cookie 认出当前登录的用户，
-// 并把用户 ID、会话 token 放进 echo 上下文，供业务 handler 取用。
 import (
 	"errors"
 	"net/http"
