@@ -8,10 +8,12 @@ import (
 
 	"netdisk/internal/file"
 	"netdisk/internal/user"
+	"netdisk/pkg/session"
 )
 
 type Deps struct {
-	DB *gorm.DB
+	DB       *gorm.DB
+	Sessions session.Store
 }
 
 // New 组装全部路由。各业务模块只负责声明自己的端点，
@@ -24,8 +26,8 @@ func New(deps Deps) *echo.Echo {
 	})
 
 	api := e.Group("/api")
-	user.RegisterRoutes(api.Group("/users"), deps.DB)
-	file.RegisterRoutes(api.Group("/files"), deps.DB)
+	user.RegisterRoutes(api.Group("/users"), deps.DB, deps.Sessions)
+	file.RegisterRoutes(api.Group("/files"), deps.DB, deps.Sessions)
 
 	return e
 }

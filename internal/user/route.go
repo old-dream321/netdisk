@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/labstack/echo/v5"
 	"gorm.io/gorm"
 
+	"netdisk/internal/auth"
 	"netdisk/pkg/httpx"
+	"netdisk/pkg/session"
 )
 
 const (
@@ -22,9 +25,15 @@ const (
 	maxUsernameLen = 64
 )
 
-func RegisterRoutes(g *echo.Group, db *gorm.DB) {
+func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store) {
+	// 注册、登录是公开的。
 	g.POST("", register(db))
-	g.POST("/login", login(db))
+	g.POST("/login", login(db, sessions))
+
+	// 登出、查当前用户需要登录：逐条挂上鉴权中间件。
+	requireLogin := auth.RequireLogin(sessions)
+	g.POST("/logout", logout(sessions), requireLogin)
+	g.GET("/me", me(db, sessions), requireLogin)
 }
 
 type registerRequest struct {
@@ -145,10 +154,97 @@ func register(db *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func login(_ *gorm.DB) echo.HandlerFunc {
+func login(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		return c.JSON(http.StatusNotImplemented, map[string]string{
-			"error": "登录接口尚未实现",
+		ctx := c.Request().Context()
+
+		var req loginRequest
+		if err := c.Bind(&req); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
+		}
+		if req.Username == "" || req.Password == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "用户名和密码不能为空"})
+		}
+
+		u, err := gorm.G[User](db).Where("username = ?", req.Username).First(ctx)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// 故意和"密码错误"回同一句话，否则这个接口就成了用户名枚举器。
+				return errBadCredentials(c)
+			}
+			return httpx.Fail(c, err, "查询用户失败")
+		}
+		if !verifyPassword(u.Password, req.Password) {
+			return errBadCredentials(c)
+		}
+
+		token, sess, err := sessions.Create(ctx, uint64(u.ID))
+		if err != nil {
+			return httpx.Fail(c, err, "创建会话失败")
+		}
+		setSessionCookie(c, token, sess.ExpiresAt)
+
+		return c.JSON(http.StatusOK, u)
+	}
+}
+
+// errBadCredentials 统一"用户不存在"和"密码错误"的响应。
+func errBadCredentials(c *echo.Context) error {
+	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "用户名或密码错误"})
+}
+
+// setSessionCookie 下发会话 cookie。
+// HttpOnly：JS 读不到，降低 XSS 偷 token 的价值；
+// SameSite=Lax：跨站发起的 POST/DELETE 不带它，挡掉大部分 CSRF；
+// Secure 暂时 false（本地是 http），上线换 https 后必须打开。
+func setSessionCookie(c *echo.Context, token string, expires time.Time) {
+	c.SetCookie(&http.Cookie{
+		Name:     session.LoginCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  expires,
+		MaxAge:   int(time.Until(expires).Seconds()),
+	})
+}
+
+func logout(sessions session.Store) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		// token 由鉴权中间件放进上下文，这里不用再解析一遍 cookie。
+		// Delete 是幂等的，重复登出不报错。
+		if err := sessions.Delete(c.Request().Context(), auth.Token(c)); err != nil {
+			return httpx.Fail(c, err, "注销会话失败")
+		}
+		// 让浏览器立刻丢弃 cookie：值清空 + MaxAge<0。
+		c.SetCookie(&http.Cookie{
+			Name:     session.LoginCookieName,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
 		})
+		return c.NoContent(http.StatusNoContent)
+	}
+}
+
+// me 是"验证登录态"的接口，也是 cookie 是否生效的探针。
+// 登录检查已经由 auth.RequireLogin 完成，这里只管查用户。
+func me(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		ctx := c.Request().Context()
+
+		u, err := gorm.G[User](db).Where("id = ?", auth.UserID(c)).First(ctx)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// 用户被删了但会话还在：当未登录处理，顺手清掉这条会话。
+				_ = sessions.Delete(ctx, auth.Token(c))
+				return c.JSON(http.StatusUnauthorized, map[string]string{"error": "用户不存在"})
+			}
+			return httpx.Fail(c, err, "查询用户失败")
+		}
+
+		return c.JSON(http.StatusOK, u)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"netdisk/internal/user"
 	"netdisk/pkg/config"
 	"netdisk/pkg/database"
+	"netdisk/pkg/session"
 )
 
 func main() {
@@ -28,7 +29,12 @@ func main() {
 		log.Fatalf("初始化数据表失败: %v", err)
 	}
 
-	e := router.New(router.Deps{DB: db})
+	sessions, err := session.NewFileStore(cfg.SessionFile, cfg.SessionTTL)
+	if err != nil {
+		log.Fatalf("初始化会话存储失败: %v", err)
+	}
+
+	e := router.New(router.Deps{DB: db, Sessions: sessions})
 
 	log.Printf("netdisk 启动，监听 %s", cfg.Addr)
 	if err := e.Start(cfg.Addr); err != nil {
