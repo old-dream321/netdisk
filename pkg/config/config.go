@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -18,6 +20,7 @@ type Config struct {
 	Storage  StorageConfig  `yaml:"storage"`
 	Session  SessionConfig  `yaml:"session"`
 	Trash    TrashConfig    `yaml:"trash"`
+	Log      LogConfig      `yaml:"log"`
 }
 
 type ServerConfig struct {
@@ -45,14 +48,38 @@ type TrashConfig struct {
 	Sweep time.Duration `yaml:"sweep"`
 }
 
+// LogConfig 控制日志级别。
+type LogConfig struct {
+	// Level 取 debug / info / warn / error（大小写不敏感），空值 = info。
+	Level string `yaml:"level"`
+}
+
+// SlogLevel 把配置里的字符串转成 slog 级别。
+func (c LogConfig) SlogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(c.Level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "", "info":
+		return slog.LevelInfo
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		log.Printf("无法识别的 log.level=%q，按 info 处理", c.Level)
+		return slog.LevelInfo
+	}
+}
+
 // Default 返回内置的默认配置。
 func Default() Config {
 	return Config{
 		Server:   ServerConfig{Addr: ":8080"},
 		Database: DatabaseConfig{DSN: "data"},
-		Storage:  StorageConfig{Dir: "storage"},
-		Session:  SessionConfig{File: "sessions.json", TTL: 24 * time.Hour},
+		Storage:  StorageConfig{Dir: "data/files"},
+		Session:  SessionConfig{File: "data/sessions.json", TTL: 24 * time.Hour},
 		Trash:    TrashConfig{TTL: 30 * 24 * time.Hour, Sweep: time.Hour},
+		Log:      LogConfig{Level: "info"},
 	}
 }
 

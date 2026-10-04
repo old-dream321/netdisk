@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
 	"netdisk/internal/file"
 	"netdisk/internal/router"
+	"netdisk/internal/share"
 	"netdisk/internal/user"
 	"netdisk/pkg/config"
 	"netdisk/pkg/database"
@@ -30,7 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("连接数据库失败: %v", err)
 	}
-	if err := database.Migrate(db, &user.User{}, &file.File{}); err != nil {
+	if err := database.Migrate(db, &user.User{}, &file.File{}, &share.Share{}); err != nil {
 		log.Fatalf("初始化数据表失败: %v", err)
 	}
 
@@ -39,7 +41,18 @@ func main() {
 		log.Fatalf("初始化会话存储失败: %v", err)
 	}
 
-	e := router.New(router.Deps{DB: db, Sessions: sessions, StorageDir: cfg.Storage.Dir})
+	// 初始化日志
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: cfg.Log.SlogLevel(),
+	}))
+	slog.SetDefault(logger)
+
+	e := router.New(router.Deps{
+		DB:         db,
+		Sessions:   sessions,
+		StorageDir: cfg.Storage.Dir,
+		Logger:     logger,
+	})
 
 	// 后台回收站清理
 	/*
@@ -63,6 +76,7 @@ func main() {
 		log.Fatalf("服务退出: %v", err)
 	}
 
+	// 等后台任务收尾
 	cancel()
 	select {
 	case <-done:

@@ -16,8 +16,7 @@ const (
 	tokenKey  = "auth:token"
 )
 
-// RequireLogin 是保护业务接口的中间件：没登录直接 401；
-// 登录了就把用户 ID 和 token 放进上下文，后续 handler 用 UserID/Token 取。
+// 没登录直接 401；登录了就把用户 ID 和 token 放进上下文，后续 handler 用 UserID/Token 取。
 func RequireLogin(sessions session.Store) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
@@ -41,15 +40,13 @@ func RequireLogin(sessions session.Store) echo.MiddlewareFunc {
 	}
 }
 
-// UserID 返回当前登录用户的 ID。
-// 只能在 RequireLogin 之后的 handler 里调用；没经过中间件时返回 0，
-// 会让查询条件变成 owner_id = 0 从而查不到任何数据，不会误放行。
+// 返回当前登录用户的 ID
 func UserID(c *echo.Context) uint64 {
 	id, _ := c.Get(userIDKey).(uint64)
 	return id
 }
 
-// Token 返回当前会话 token（登出时要用它删掉对应的会话）。
+// 返回当前会话 token（登出时要用它删掉对应的会话）
 func Token(c *echo.Context) string {
 	token, _ := c.Get(tokenKey).(string)
 	return token

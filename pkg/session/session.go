@@ -21,16 +21,14 @@ const (
 	LoginCookieName = "netdisk_session"
 )
 
-// ErrNotFound 表示 token 不存在、已过期或已被登出。
 var ErrNotFound = errors.New("会话不存在或已过期")
 
-// Session 是登录态的载荷。真实项目里常存 user_id、角色、登录时间等。
 type Session struct {
 	UserID    uint64    `json:"user_id"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// Store 是登录态的存储抽象。换 Redis 就是换这个接口的实现。
+// Store 是会话存储的接口，要更换只需实现这个
 type Store interface {
 	// Create 生成新 token 并写入一条会话，有效期由 store 自己的 ttl 决定。
 	Create(ctx context.Context, userID uint64) (token string, sess Session, err error)
@@ -40,8 +38,6 @@ type Store interface {
 	Delete(ctx context.Context, token string) error
 }
 
-// NewToken 生成 32 字节随机 token（base64url 后 43 个字符）。
-// 用 crypto/rand 而不是 math/rand：后者可预测，token 会被猜出来。
 func NewToken() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {

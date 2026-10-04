@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -79,9 +79,6 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			name = header.Filename
 		}
 
-		// 同级重名检查，和 createdir 用同一套规则。
-		// 放在落盘之前：注定失败的上传不该先写一遍磁盘。
-		// 新条目还没有 id，excludeID 传 0。
 		taken, err := nameTaken(ctx, db, ownerID, parentID, name, 0)
 		if err != nil {
 			return httpx.Fail(c, err, "检查同名条目失败")
@@ -118,83 +115,12 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 
 		// 刷新用量缓存（/me 显示的数字）。失败只影响展示，不该让上传失败。
 		if _, err := user.RefreshUsed(ctx, db, ownerID); err != nil {
-			log.Printf("刷新用户 %d 的用量失败: %v", ownerID, err)
+			slog.Warn("刷新用户用量失败", "err", err, "owner_id", ownerID)
 		}
 
 		return c.JSON(http.StatusCreated, f)
 	}
 }
-
-// parseOptionalUint 解析表单里"引用型"的可选整数（parent_id）：
-// 缺省时返回 fallback，填了但不合法则返回错误。这类值静默回退很危险——
-// parent_id 写错会被塞进根目录，用户完全察觉不到。
-func parseOptionalUint(raw string, fallback uint64) (uint64, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return fallback, nil
-	}
-	return strconv.ParseUint(raw, 10, 64)
-}
-
-// errParentInvalid 是父目录校验失败的统一错误。
-// "不存在""不属于你""不是目录""已删除"故意共用一句话：
-// 若分别提示，就等于向调用方泄露了别人目录的存在性。
-var errParentInvalid = errors.New("父目录不存在或不是可用目录")
-
-func checkParent(ctx context.Context, db *gorm.DB, ownerID, parentID uint64) error {
-	if parentID == 0 {
-		return nil
-	}
-
-	parent, err := gorm.G[File](db).Where("id = ?", parentID).First(ctx)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return errParentInvalid
-		}
-		return fmt.Errorf("查询父目录: %w", err)
-	}
-	if parent.OwnerID != ownerID || parent.Type != TypeDir || parent.Status != StatusNormal {
-		return errParentInvalid
-	}
-	return nil
-}
-
-// writeParentCheckError 把 checkParent 的错误翻成响应：
-// 校验不通过是调用方的问题(400)，查询本身失败是服务端的锅(500)。
-func writeParentCheckError(c *echo.Context, err error) error {
-	if errors.Is(err, errParentInvalid) {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
-	}
-	return httpx.Fail(c, err, "校验父目录失败")
-}
-
-// nameTaken 判断同级下是否已经存在"正常状态"的同名条目。
-//
-// 同名规则：只有 status=正常 的条目占名字。
-// 回收站里的（status=2）不占——用户删掉一个东西之后，应该能马上重建同名；
-// 已彻底删除（status=3）的记录根本不存在，自然也不占。
-// 恢复（restore）时再单独校验一次，因为此时名字可能已经被新条目用掉了。
-//
-// excludeID 用来把自己排除掉：改名/移动时"保持原来的名字或位置"不该算冲突，
-// 否则把 a.txt 改名成 a.txt、或把文件移到它现在所在的目录，都会被误判成重名。
-// 新建条目（还没有 id）传 0。
-func nameTaken(ctx context.Context, db *gorm.DB, ownerID, parentID uint64, name string, excludeID uint64) (bool, error) {
-	q := gorm.G[File](db).
-		Where("owner_id = ? AND parent_id = ? AND name = ? AND status = ?",
-			ownerID, parentID, name, StatusNormal)
-	if excludeID != 0 {
-		q = q.Where("id <> ?", excludeID)
-	}
-
-	n, err := q.Count(ctx, "*")
-	if err != nil {
-		return false, fmt.Errorf("检查同名条目: %w", err)
-	}
-	return n > 0, nil
-}
-
-// errNameTaken 是同名冲突的统一错误，upload / createdir / restore / update 共用。
-var errNameTaken = errors.New("同级下已存在同名文件或目录")
 
 func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
@@ -217,26 +143,7 @@ func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 		if f.Type != TypeFile || f.Status != StatusNormal || f.StorageKey == "" {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不可用"})
 		}
-
-		src, err := os.Open(objectPath(storageDir, f.StorageKey))
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取文件内容失败"})
-		}
-		defer src.Close()
-
-		info, err := src.Stat()
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取文件信息失败"})
-		}
-
-		h := c.Response().Header()
-		if cd := contentDisposition(f.Name); cd != "" {
-			h.Set(echo.HeaderContentDisposition, cd)
-		}
-		// ServeContent 自带 Content-Type 探测、Content-Length、
-		// Last-Modified 和 Range 支持（断点续传/视频拖动进度条都靠它）。
-		http.ServeContent(c.Response(), c.Request(), f.Name, info.ModTime(), src)
-		return nil
+		return ServeObject(c, storageDir, f)
 	}
 }
 
@@ -266,8 +173,6 @@ func list(db *gorm.DB) echo.HandlerFunc {
 		// gorm.G[File](db) 已经把模型类型固定住了，不用再写 Model(&File{})；
 		// 这里的 Where 返回 ChainInterface[File]，所以后续链式调用都必须
 		// 赋回同一个变量 q（GORM 的不可变链式，和经典 API 一致）。
-		//
-		// owner_id 来自会话而不是客户端参数：这是"只看得到自己的文件"的关键。
 		q := gorm.G[File](db).Where("owner_id = ?", ownerID)
 
 		if req.ParentID != nil {
@@ -291,9 +196,6 @@ func list(db *gorm.DB) echo.HandlerFunc {
 			limit = maxPageSize
 		}
 
-		// 泛型 Find 直接返回 []File。GORM 在 scan 阶段会把目标切片
-		// 初始化成长度 0 的非 nil 切片，所以查不到数据时序列化出来就是
-		// []，不需要自己 make（实测确认过）。
 		items, err := q.Order("type DESC, name ASC"). // 目录(2) 排在文件(1) 前面
 								Limit(int(limit)).
 								Offset(int(req.Offset)).
@@ -477,7 +379,7 @@ func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, stor
 		if refs > 0 {
 			continue
 		}
-		if err := os.Remove(objectPath(storageDir, key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(ObjectPath(storageDir, key)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("删除对象文件: %w", err)
 		}
 	}
@@ -485,7 +387,7 @@ func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, stor
 	// 彻底删除才释放配额（回收站里的还占着），所以刷新一下用量缓存。
 	// 记录已经删了，这里失败只影响展示，不该让请求报错。
 	if _, err := user.RefreshUsed(ctx, db, ownerID); err != nil {
-		log.Printf("刷新用户 %d 的用量失败: %v", ownerID, err)
+		slog.Warn("刷新用户用量失败", "err", err, "owner_id", ownerID)
 	}
 	return nil
 }
@@ -592,48 +494,6 @@ func restore(db *gorm.DB) echo.HandlerFunc {
 type updateRequest struct {
 	Name     *string `json:"name"`      // nil = 不改名
 	ParentID *uint64 `json:"parent_id"` // nil = 不移动；&0 = 移到根目录
-}
-
-// errMoveToSelf / errMoveToDescendant 是两类会把目录树弄坏的移动。
-var (
-	errMoveToSelf       = errors.New("不能把条目移动到它自己里面")
-	errMoveToDescendant = errors.New("不能把目录移动到它自己的子目录里")
-)
-
-// checkMoveTarget 校验 newParentID 能不能作为 file 的新位置。
-// checkParent 负责"目标目录本身是否可用"，这里额外拦两类会造成环的移动——
-// 一旦成环（A 在 B 里、B 又在 A 里），从列表就再也走不到这些记录，
-// 而 collectSubtree 之类的遍历会死循环。
-func checkMoveTarget(ctx context.Context, db *gorm.DB, ownerID uint64, file File, newParentID uint64) error {
-	if err := checkParent(ctx, db, ownerID, newParentID); err != nil {
-		return err
-	}
-	if newParentID == file.ID {
-		return errMoveToSelf
-	}
-	if file.Type != TypeDir {
-		return nil // 文件没有子孙，不可能成环
-	}
-
-	descendants, err := collectSubtree(ctx, db, ownerID, file.ID)
-	if err != nil {
-		return err
-	}
-	for _, d := range descendants {
-		if d.ID == newParentID {
-			return errMoveToDescendant
-		}
-	}
-	return nil
-}
-
-// writeMoveError 把移动目标的校验错误翻成响应：都是调用方输入的问题(400)，
-// 查询本身失败才是服务端的锅(500)。
-func writeMoveError(c *echo.Context, err error) error {
-	if errors.Is(err, errParentInvalid) || errors.Is(err, errMoveToSelf) || errors.Is(err, errMoveToDescendant) {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
-	}
-	return httpx.Fail(c, err, "校验移动目标失败")
 }
 
 // update 处理 PATCH /api/files/:id：改名、移动，或者两者一起。
