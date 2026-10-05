@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -39,7 +38,7 @@ func ContentDisposition(name string) string {
 func ServeObject(c *echo.Context, storageDir string, f File) error {
 	src, err := os.Open(ObjectPath(storageDir, f.StorageKey))
 	if err != nil {
-		slog.Error("对象文件打开失败，记录与磁盘不一致",
+		c.Logger().Error("对象文件打开失败，记录与磁盘不一致",
 			"err", err, "file_id", f.ID, "owner_id", f.OwnerID, "storage_key", f.StorageKey)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取文件内容失败"})
 	}
@@ -47,7 +46,7 @@ func ServeObject(c *echo.Context, storageDir string, f File) error {
 
 	info, err := src.Stat()
 	if err != nil {
-		slog.Error("读取对象文件信息失败",
+		c.Logger().Error("读取对象文件信息失败",
 			"err", err, "file_id", f.ID, "storage_key", f.StorageKey)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "读取文件信息失败"})
 	}
@@ -155,6 +154,38 @@ func nameTaken(ctx context.Context, db *gorm.DB, ownerID, parentID uint64, name 
 }
 
 var errNameTaken = errors.New("同级下已存在同名文件或目录")
+
+const maxNameBytes = 255
+
+func validateName(name string) error {
+	if name == "" {
+		return errors.New("名字不能为空")
+	}
+	if name == "." || name == ".." {
+		return errors.New("名字不能是 . 或 ..")
+	}
+	if len(name) > maxNameBytes {
+		return fmt.Errorf("名字过长（最多 %d 字节）", maxNameBytes)
+	}
+	for _, r := range name {
+		switch {
+		case r == '/' || r == '\\':
+			return errors.New(`名字不能包含 / 或 \`)
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("名字不能包含控制字符（%q）", r)
+		}
+	}
+	return nil
+}
+
+// 取路径最后一段
+func sanitizeUploadName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if i := strings.LastIndexAny(raw, `/\`); i >= 0 {
+		raw = raw[i+1:]
+	}
+	return raw
+}
 
 var (
 	errMoveToSelf       = errors.New("不能把条目移动到它自己里面")

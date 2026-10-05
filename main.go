@@ -14,7 +14,7 @@ import (
 	"netdisk/internal/user"
 	"netdisk/pkg/config"
 	"netdisk/pkg/database"
-	"netdisk/pkg/session"
+	"netdisk/pkg/token"
 )
 
 func main() {
@@ -36,9 +36,9 @@ func main() {
 		log.Fatalf("初始化数据表失败: %v", err)
 	}
 
-	sessions, err := session.NewFileStore(cfg.Session.File, cfg.Session.TTL)
+	signer, err := token.New(cfg.Auth.Secret, cfg.Auth.TTL)
 	if err != nil {
-		log.Fatalf("初始化会话存储失败: %v", err)
+		log.Fatalf("初始化登录凭证失败: %v", err)
 	}
 
 	// 初始化日志
@@ -49,7 +49,7 @@ func main() {
 
 	e := router.New(router.Deps{
 		DB:         db,
-		Sessions:   sessions,
+		Signer:     signer,
 		StorageDir: cfg.Storage.Dir,
 		Logger:     logger,
 	})
@@ -70,8 +70,8 @@ func main() {
 		file.StartJanitor(ctx, db, cfg.Storage.Dir, cfg.Trash.TTL, cfg.Trash.Sweep)
 	}()
 
-	log.Printf("netdisk 启动，监听 %s（存储目录 %s，会话 TTL %s，回收站保留 %s）",
-		cfg.Server.Addr, cfg.Storage.Dir, cfg.Session.TTL, cfg.Trash.TTL)
+	log.Printf("netdisk 启动，监听 %s（存储目录 %s，回收站保留 %s，登录有效期 %s）",
+		cfg.Server.Addr, cfg.Storage.Dir, cfg.Trash.TTL, cfg.Auth.TTL)
 	if err := e.Start(cfg.Server.Addr); err != nil {
 		log.Fatalf("服务退出: %v", err)
 	}

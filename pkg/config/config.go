@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -18,7 +19,7 @@ type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Database DatabaseConfig `yaml:"database"`
 	Storage  StorageConfig  `yaml:"storage"`
-	Session  SessionConfig  `yaml:"session"`
+	Auth     AuthConfig     `yaml:"auth"`
 	Trash    TrashConfig    `yaml:"trash"`
 	Log      LogConfig      `yaml:"log"`
 }
@@ -35,12 +36,12 @@ type StorageConfig struct {
 	Dir string `yaml:"dir"`
 }
 
-type SessionConfig struct {
-	File string        `yaml:"file"`
-	TTL  time.Duration `yaml:"ttl"`
+type AuthConfig struct {
+	// Secret 是 HMAC 签名密钥， 换掉它会让所有人下线
+	Secret string        `yaml:"secret"`
+	TTL    time.Duration `yaml:"ttl"`
 }
 
-// TrashConfig 控制后台清理：进了回收站的条目躺够 TTL，就被彻底删除。
 type TrashConfig struct {
 	// 回收站里的保留时长
 	TTL time.Duration `yaml:"ttl"`
@@ -50,11 +51,10 @@ type TrashConfig struct {
 
 // LogConfig 控制日志级别。
 type LogConfig struct {
-	// Level 取 debug / info / warn / error（大小写不敏感），空值 = info。
+	// Level 取 debug / info / warn / error
 	Level string `yaml:"level"`
 }
 
-// SlogLevel 把配置里的字符串转成 slog 级别。
 func (c LogConfig) SlogLevel() slog.Level {
 	switch strings.ToLower(strings.TrimSpace(c.Level)) {
 	case "debug":
@@ -77,7 +77,7 @@ func Default() Config {
 		Server:   ServerConfig{Addr: ":8080"},
 		Database: DatabaseConfig{DSN: "data"},
 		Storage:  StorageConfig{Dir: "data/files"},
-		Session:  SessionConfig{File: "data/sessions.json", TTL: 24 * time.Hour},
+		Auth:     AuthConfig{TTL: 24 * time.Hour}, // Secret 留空：Load 里生成
 		Trash:    TrashConfig{TTL: 30 * 24 * time.Hour, Sweep: time.Hour},
 		Log:      LogConfig{Level: "info"},
 	}
@@ -91,10 +91,11 @@ func Load() (Config, error) {
 		}
 
 		cfg := Default()
+		cfg.normalize() // 生成 auth.secret
 		if err := saveConfig(cfg); err != nil {
 			log.Printf("无法生成默认配置文件（将只使用内置默认值）: %v", err)
 		} else {
-			log.Printf("已生成默认配置文件 %s，修改后重启即可生效", DefaultConfigFile)
+			log.Printf("已生成默认配置文件 %s（含随机 auth.secret），修改后重启即可生效", DefaultConfigFile)
 		}
 		return cfg, nil
 	}
@@ -104,12 +105,21 @@ func Load() (Config, error) {
 	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("解析配置文件 %s: %w", DefaultConfigFile, err)
 	}
-	cfg.normalize()
+	if cfg.normalize() {
+		// 把新生成的密钥写回去
+		if err := saveConfig(cfg); err != nil {
+			return Config{}, fmt.Errorf("把生成的 auth.secret 写回 %s: %w", DefaultConfigFile, err)
+		}
+		log.Printf("已在 %s 里生成随机 auth.secret；换掉它会让所有人下线", DefaultConfigFile)
+	}
 	return cfg, nil
 }
 
-func (c *Config) normalize() {
+// 补默认值。返回值表示"配置被改动了，需要写回文件"
+func (c *Config) normalize() bool {
 	def := Default()
+	changed := false
+
 	if c.Server.Addr == "" {
 		c.Server.Addr = def.Server.Addr
 	}
@@ -119,13 +129,16 @@ func (c *Config) normalize() {
 	if c.Storage.Dir == "" {
 		c.Storage.Dir = def.Storage.Dir
 	}
-	if c.Session.File == "" {
-		c.Session.File = def.Session.File
+
+	if c.Auth.Secret == "" {
+		c.Auth.Secret = newSecret()
+		changed = true
 	}
-	if c.Session.TTL <= 0 {
-		log.Printf("session.ttl 未设置或不是正数，使用默认值 %s", def.Session.TTL)
-		c.Session.TTL = def.Session.TTL
+	if c.Auth.TTL <= 0 {
+		log.Printf("auth.ttl 未设置或不是正数，使用默认值 %s", def.Auth.TTL)
+		c.Auth.TTL = def.Auth.TTL
 	}
+
 	if c.Trash.TTL <= 0 {
 		log.Printf("trash.ttl 未设置或不是正数，使用默认值 %s", def.Trash.TTL)
 		c.Trash.TTL = def.Trash.TTL
@@ -134,6 +147,12 @@ func (c *Config) normalize() {
 		log.Printf("trash.sweep 未设置或不是正数，使用默认值 %s", def.Trash.Sweep)
 		c.Trash.Sweep = def.Trash.Sweep
 	}
+
+	return changed
+}
+
+func newSecret() string {
+	return rand.Text()
 }
 
 func saveConfig(cfg Config) error {

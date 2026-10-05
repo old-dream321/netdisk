@@ -18,7 +18,7 @@ import (
 	"netdisk/internal/auth"
 	"netdisk/internal/user"
 	"netdisk/pkg/httpx"
-	"netdisk/pkg/session"
+	"netdisk/pkg/token"
 )
 
 const (
@@ -29,8 +29,8 @@ const (
 	maxPageSize     = 1000
 )
 
-func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store, storageDir string) {
-	g = g.Group("", auth.RequireLogin(sessions))
+func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer, storageDir string) {
+	g = g.Group("", auth.RequireLogin(signer))
 
 	g.POST("/list", list(db)) // 列表：POST + JSON body
 	g.POST("/upload", upload(db, storageDir))
@@ -74,9 +74,14 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return writeParentCheckError(c, err)
 		}
 
+		// 显式给的名字严格校验
 		name := strings.TrimSpace(c.FormValue("name"))
 		if name == "" {
-			name = header.Filename
+			// 没给就取 header.Filename 的最后一段（因为有可能是路径）
+			name = sanitizeUploadName(header.Filename)
+		}
+		if err := validateName(name); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 
 		taken, err := nameTaken(ctx, db, ownerID, parentID, name, 0)
@@ -93,7 +98,6 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 		}
 		defer src.Close()
 
-		// 内容先落盘，再做记录，避免出现「有记录没文件」。
 		storageKey, size, hash, err := saveUpload(storageDir, src)
 		if err != nil {
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "保存文件失败"})
@@ -113,9 +117,9 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return httpx.Fail(c, err, "写入文件记录失败")
 		}
 
-		// 刷新用量缓存（/me 显示的数字）。失败只影响展示，不该让上传失败。
+		// 刷新用量缓存
 		if _, err := user.RefreshUsed(ctx, db, ownerID); err != nil {
-			slog.Warn("刷新用户用量失败", "err", err, "owner_id", ownerID)
+			c.Logger().Warn("刷新用户用量失败", "err", err, "owner_id", ownerID)
 		}
 
 		return c.JSON(http.StatusCreated, f)
@@ -147,9 +151,7 @@ func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	}
 }
 
-// listRequest 是列表的查询条件。
-//
-// 用指针是为了区分"没传"和"传了零值"：
+// 用指针是区分"没传"和"传了零值"：
 //   - ParentID 为 nil = 该用户的全部文件；为 0 = 只看根目录；
 //   - Status 为 nil = 只看正常文件（1），传 2 就是看回收站。
 type listRequest struct {
@@ -170,9 +172,6 @@ func list(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
 		}
 
-		// gorm.G[File](db) 已经把模型类型固定住了，不用再写 Model(&File{})；
-		// 这里的 Where 返回 ChainInterface[File]，所以后续链式调用都必须
-		// 赋回同一个变量 q（GORM 的不可变链式，和经典 API 一致）。
 		q := gorm.G[File](db).Where("owner_id = ?", ownerID)
 
 		if req.ParentID != nil {
@@ -228,8 +227,8 @@ func createDir(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "请求体解析失败"})
 		}
 		req.Name = strings.TrimSpace(req.Name)
-		if req.Name == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "目录名不能为空"})
+		if err := validateName(req.Name); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 
 		if err := checkParent(ctx, db, ownerID, req.ParentID); err != nil {
@@ -291,10 +290,7 @@ func removefile(ctx context.Context, db *gorm.DB, fileid uint64) error {
 	return nil
 }
 
-// collectSubtree 返回 rootID 下的所有子孙（不含 rootID 自己）。
-// 只走 ownerID 自己的记录：这里的结果会被用于不可逆的操作，
-// 不能靠"父子记录的 owner 应该一致"这种推断来兜底。
-// 用队列做广度优先而不是递归，避免目录层级极深时把调用栈压爆。
+// 返回 rootID 下的所有子孙（不含 rootID 自己）。
 func collectSubtree(ctx context.Context, db *gorm.DB, ownerID, rootID uint64) ([]File, error) {
 	var out []File
 	queue := []uint64{rootID}
@@ -316,9 +312,7 @@ func collectSubtree(ctx context.Context, db *gorm.DB, ownerID, rootID uint64) ([
 	return out, nil
 }
 
-// restoreTree 把 id 及所有"还在回收站里"的子孙恢复成正常状态，返回恢复的条数。
-// 已经正常的子项不动（它可能是单独恢复过的）；已彻底删除的也不会被复活
-// （那种记录早已不存在）。
+// 把 id 及所有"还在回收站里"的子孙恢复成正常状态，返回恢复的条数。
 func restoreTree(ctx context.Context, db *gorm.DB, ownerID, id uint64) (int, error) {
 	descendants, err := collectSubtree(ctx, db, ownerID, id)
 	if err != nil {
@@ -368,9 +362,7 @@ func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, stor
 		return fmt.Errorf("删除记录: %w", err)
 	}
 
-	// 内容寻址存储让多条记录共享同一个 storage_key（这正是去重的代价），
-	// 所以删对象之前必须确认"全表（包括别人的、回收站里的）没有任何记录还引用它"。
-	// 只看自己的记录会把别人正在用的文件删掉。
+	// 确认"全表（包括别人的、回收站里的）没有任何记录还引用它"。
 	for _, key := range keys {
 		refs, err := gorm.G[File](db).Where("storage_key = ?", key).Count(ctx, "*")
 		if err != nil {
@@ -384,8 +376,6 @@ func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, stor
 		}
 	}
 
-	// 彻底删除才释放配额（回收站里的还占着），所以刷新一下用量缓存。
-	// 记录已经删了，这里失败只影响展示，不该让请求报错。
 	if _, err := user.RefreshUsed(ctx, db, ownerID); err != nil {
 		slog.Warn("刷新用户用量失败", "err", err, "owner_id", ownerID)
 	}
@@ -521,8 +511,8 @@ func update(db *gorm.DB) echo.HandlerFunc {
 		newName := ""
 		if req.Name != nil {
 			newName = strings.TrimSpace(*req.Name)
-			if newName == "" {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "新名字不能为空"})
+			if err := validateName(newName); err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			}
 		}
 

@@ -12,13 +12,13 @@ import (
 	"netdisk/internal/file"
 	"netdisk/internal/share"
 	"netdisk/internal/user"
-	"netdisk/pkg/session"
+	"netdisk/pkg/token"
 )
 
 type Deps struct {
 	DB         *gorm.DB
-	Sessions   session.Store
-	StorageDir string // 对象存储根目录（来自配置文件）
+	Signer     *token.Signer // 登录凭证的签发/校验器
+	StorageDir string        // 对象存储根目录（来自配置文件）
 	Logger     *slog.Logger
 }
 
@@ -39,30 +39,26 @@ func New(deps Deps) *echo.Echo {
 	})
 
 	api := e.Group("/api")
-	user.RegisterRoutes(api.Group("/users"), deps.DB, deps.Sessions)
-	file.RegisterRoutes(api.Group("/files"), deps.DB, deps.Sessions, deps.StorageDir)
+	user.RegisterRoutes(api.Group("/users"), deps.DB, deps.Signer)
+	file.RegisterRoutes(api.Group("/files"), deps.DB, deps.Signer, deps.StorageDir)
 
 	// 分享分两组：需要登录的挂 /api/shares
-	share.RegisterRoutes(api.Group("/shares"), deps.DB, deps.Sessions)
+	share.RegisterRoutes(api.Group("/shares"), deps.DB, deps.Signer)
 	share.RegisterPublicRoutes(e, deps.DB, deps.StorageDir)
 
 	return e
 }
 
-// 构造请求日志中间件。
-//
-// 用 RequestLoggerWithConfig 而不是现成的 RequestLogger()，是因为有三处要改：
-//
-//  1. Skipper：/s/:token —— 那个 token 是访问分享的唯一凭证，不能明文进日志文件。
-//  2. 只要六个字段。默认那一套里的 host / user_agent / request_id /
-//     bytes_in / bytes_out 用不上
-//  3. latency 记成 "25.4µs" 比默认的纳秒整数（25402）好读
+// 请求日志中间件。
 func newRequestLogger() echo.MiddlewareFunc {
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 		Skipper: func(c *echo.Context) bool {
-			// c.Path() 返回的是匹配到的路由模板（"/s/:token"），不是实际 URI，
-			// 所以不同时不同 token 都能命中。
-			return c.Path() == "/s/:token"
+			// 防止分享token泄露
+			switch c.Path() {
+			case "/s/:token", "/s/:token/*":
+				return true
+			}
+			return false
 		},
 		LogMethod:   true,
 		LogURI:      true,

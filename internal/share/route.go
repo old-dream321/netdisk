@@ -13,21 +13,25 @@ import (
 	"netdisk/internal/auth"
 	"netdisk/internal/file"
 	"netdisk/pkg/httpx"
-	"netdisk/pkg/session"
+	"netdisk/pkg/token"
 )
 
 // 需要登录的路由
-func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store) {
-	g = g.Group("", auth.RequireLogin(sessions))
+func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer) {
+	g = g.Group("", auth.RequireLogin(signer))
 	g.POST("/create", create(db))
 	g.GET("", list(db))
 	g.DELETE("/:id", revoke(db))
 }
 
-// “打开分享链接”的公开路由
+// “打开分享链接”的公开路由。
+// 两个路径都要注册：`/s/:token` 匹配根自己，`/s/:token/*` 匹配子路径
 func RegisterPublicRoutes(e *echo.Echo, db *gorm.DB, storageDir string) {
-	e.HEAD("/s/:token", get(db, storageDir))
-	e.GET("/s/:token", get(db, storageDir))
+	h := serve(db, storageDir)
+	e.GET("/s/:token", h)
+	e.GET("/s/:token/*", h)
+	e.HEAD("/s/:token", h)
+	e.HEAD("/s/:token/*", h)
 }
 
 func newToken() string {
@@ -66,10 +70,6 @@ func create(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不在正常状态"})
 		}
 
-		if target.Type != file.TypeFile {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "暂不支持分享目录"})
-		}
-
 		if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "过期时间必须晚于当前时间"})
 		}
@@ -94,40 +94,100 @@ func create(db *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func get(db *gorm.DB, storageDir string) echo.HandlerFunc {
+func serve(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 
-		token := c.Param("token")
-		if token == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "token不能为空"})
-		}
-
-		target, err := gorm.G[Share](db).Where("token = ?", token).First(ctx)
+		res, err := resolve(ctx, db, c.Param("token"), c.Param("*"))
 		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return c.JSON(http.StatusNotFound, map[string]string{"error": "分享不存在"})
+			return writeResolveError(c, err)
+		}
+
+		// 下载走同一个路径，只是多一个开关
+		if c.QueryParam("download") == "1" {
+			if res.Target.Type != file.TypeFile {
+				// 打包下载整个目录（zip）以后做，入口就留在这里。
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "暂不支持下载整个目录"})
 			}
-			return httpx.Fail(c, err, "查询分享失败")
+			return file.ServeObject(c, storageDir, res.Target)
 		}
 
-		if target.ExpiresAt != nil && !target.ExpiresAt.After(time.Now()) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "分享已过期"})
+		if res.Target.Type == file.TypeDir {
+			return viewDir(c, db, res)
 		}
 
-		f, err := gorm.G[file.File](db).Where("id = ?", target.FileID).First(ctx)
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return c.JSON(http.StatusNotFound, map[string]string{"error": "分享文件不存在"})
-			}
-			return httpx.Fail(c, err, "查询分享文件失败")
-		}
-		if f.Type != file.TypeFile || f.Status != file.StatusNormal || f.StorageKey == "" {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不可用"})
-		}
-
-		return file.ServeObject(c, storageDir, f)
+		// 单个文件的"展示"
+		return c.JSON(http.StatusOK, map[string]any{
+			"name":         res.Target.Name,
+			"type":         typeName(res.Target.Type),
+			"size":         res.Target.Size,
+			"expires_at":   res.Share.ExpiresAt,
+			"download_url": downloadURL(res.Share.Token, res.Path),
+		})
 	}
+}
+
+// viewDir 列出目录内容。形状和 files/list 保持一致（items/count/limit/offset）。
+func viewDir(c *echo.Context, db *gorm.DB, res resolved) error {
+	ctx := c.Request().Context()
+
+	limit, offset, err := page(c)
+	if err != nil {
+		return err
+	}
+
+	items, err := gorm.G[file.File](db).
+		Where("parent_id = ? AND owner_id = ? AND status = ?",
+						res.Target.ID, res.Share.OwnerID, file.StatusNormal).
+		Order("type DESC, name ASC"). // 目录(2) 排在文件(1) 前面，和 files/list 一致
+		Limit(limit).
+		Offset(offset).
+		Find(ctx)
+	if err != nil {
+		return httpx.Fail(c, err, "查询目录内容失败")
+	}
+
+	// 子项的路径 = 当前路径 + 自己的名字，用它拼下载地址。
+	list := make([]map[string]any, 0, len(items))
+	for _, f := range items {
+		path := make([]string, 0, len(res.Path)+1)
+		path = append(append(path, res.Path...), f.Name)
+		list = append(list, map[string]any{
+			"name":         f.Name,
+			"type":         typeName(f.Type),
+			"size":         f.Size,
+			"download_url": downloadURL(res.Share.Token, path),
+		})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"name":       res.Target.Name,
+		"type":       typeName(res.Target.Type),
+		"expires_at": res.Share.ExpiresAt,
+		"items":      list,
+		"count":      len(list),
+		"limit":      limit,
+		"offset":     offset,
+	})
+}
+
+func page(c *echo.Context) (limit, offset int, err error) {
+	limit = defaultListLimit
+	if s := c.QueryParam("limit"); s != "" {
+		v, e := strconv.Atoi(s)
+		if e != nil || v <= 0 {
+			return 0, 0, c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 limit"})
+		}
+		limit = min(v, maxListLimit) // 超上限就截断，不报错
+	}
+	if s := c.QueryParam("offset"); s != "" {
+		v, e := strconv.Atoi(s)
+		if e != nil || v < 0 {
+			return 0, 0, c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 offset"})
+		}
+		offset = v
+	}
+	return limit, offset, nil
 }
 
 // 分页上限
@@ -141,21 +201,9 @@ func list(db *gorm.DB) echo.HandlerFunc {
 		ctx := c.Request().Context()
 		ownerID := auth.UserID(c)
 
-		limit := defaultListLimit
-		if s := c.QueryParam("limit"); s != "" {
-			v, err := strconv.Atoi(s)
-			if err != nil || v <= 0 {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 limit"})
-			}
-			limit = min(v, maxListLimit) // 超上限就截断，不报错
-		}
-		offset := 0
-		if s := c.QueryParam("offset"); s != "" {
-			v, err := strconv.Atoi(s)
-			if err != nil || v < 0 {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 offset"})
-			}
-			offset = v
+		limit, offset, err := page(c)
+		if err != nil {
+			return err
 		}
 
 		shares, err := gorm.G[Share](db).
@@ -205,7 +253,7 @@ func list(db *gorm.DB) echo.HandlerFunc {
 				"expires_at": s.ExpiresAt,
 				"file_id":    s.FileID,
 				"file_name":  name,
-				"available":  exists && f.Type == file.TypeFile && f.Status == file.StatusNormal,
+				"available":  exists && f.Status == file.StatusNormal,
 				"expired":    s.ExpiresAt != nil && !s.ExpiresAt.After(now),
 			})
 		}

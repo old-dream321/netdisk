@@ -13,7 +13,7 @@ import (
 
 	"netdisk/internal/auth"
 	"netdisk/pkg/httpx"
-	"netdisk/pkg/session"
+	"netdisk/pkg/token"
 )
 
 const (
@@ -23,15 +23,15 @@ const (
 	maxUsernameLen = 64
 )
 
-func RegisterRoutes(g *echo.Group, db *gorm.DB, sessions session.Store) {
+func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer) {
 	// 注册、登录是公开的。
 	g.POST("/register", register(db))
-	g.POST("/login", login(db, sessions))
+	g.POST("/login", login(db, signer))
 
 	// 登出、查当前用户需要登录：逐条挂上鉴权中间件。
-	requireLogin := auth.RequireLogin(sessions)
-	g.POST("/logout", logout(sessions), requireLogin)
-	g.GET("/me", me(db, sessions), requireLogin)
+	requireLogin := auth.RequireLogin(signer)
+	g.POST("/logout", logout(), requireLogin)
+	g.GET("/me", me(db), requireLogin)
 }
 
 type registerRequest struct {
@@ -98,9 +98,6 @@ func register(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 
-		// 下面两个预检查只是为了告诉用户"具体是哪个字段重复了"。
-		// 真正的唯一性保障是数据库唯一索引（见 Create 的错误分支）——
-		// "先查后插"在并发下必然存在窗口，不能当唯一防线。
 		sameName, err := gorm.G[User](db).Where("username = ?", req.Username).Count(ctx, "*")
 		if err != nil {
 			return httpx.Fail(c, err, "查询用户失败")
@@ -119,7 +116,6 @@ func register(db *gorm.DB) echo.HandlerFunc {
 
 		hash, err := hashPassword(req.Password)
 		if err != nil {
-			// 长度已在校验阶段挡过，走到这里基本只会是真的故障。
 			return httpx.Fail(c, err, "生成密码摘要失败")
 		}
 
@@ -130,9 +126,7 @@ func register(db *gorm.DB) echo.HandlerFunc {
 			Quota:    defaultQuota,
 		}
 		if err := gorm.G[User](db).Create(ctx, &u); err != nil {
-			// 并发下可能有人在我们预检查之后抢先占了用户名/邮箱，
-			// 此时唯一索引会报 ErrDuplicatedKey（靠 gorm.Config.TranslateError
-			// 翻译而来）——这是最后一道防线，要翻成 409 而不是 500。
+			// 并发下可能有人在预检查之后抢先占了用户名/邮箱
 			if errors.Is(err, gorm.ErrDuplicatedKey) {
 				return c.JSON(http.StatusConflict, map[string]string{"error": "用户名或邮箱已被占用"})
 			}
@@ -143,7 +137,7 @@ func register(db *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func login(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
+func login(db *gorm.DB, signer *token.Signer) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 
@@ -166,45 +160,38 @@ func login(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
 			return errBadCredentials(c)
 		}
 
-		token, sess, err := sessions.Create(ctx, uint64(u.ID))
+		raw, expires, err := signer.Issue(uint64(u.ID))
 		if err != nil {
-			return httpx.Fail(c, err, "创建会话失败")
+			return httpx.Fail(c, err, "签发登录凭证失败")
 		}
-		setSessionCookie(c, token, sess.ExpiresAt)
+		setSessionCookie(c, raw, expires)
 
 		return c.JSON(http.StatusOK, u)
 	}
 }
 
-// errBadCredentials 统一"用户不存在"和"密码错误"的响应。
 func errBadCredentials(c *echo.Context) error {
 	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "用户名或密码错误"})
 }
 
-// setSessionCookie 下发会话 cookie。
-// HttpOnly：JS 读不到，降低 XSS 偷 token 的价值；
-// SameSite=Lax：跨站发起的 POST/DELETE 不带它，挡掉大部分 CSRF；
-// Secure 暂时 false（本地是 http），上线换 https 后必须打开。
-func setSessionCookie(c *echo.Context, token string, expires time.Time) {
+func setSessionCookie(c *echo.Context, raw string, expires time.Time) {
 	c.SetCookie(&http.Cookie{
-		Name:     session.LoginCookieName,
-		Value:    token,
+		Name:     token.CookieName,
+		Value:    raw,
 		Path:     "/",
-		HttpOnly: true,
+		HttpOnly: true, // 禁止 JS 读取
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expires,
 		MaxAge:   int(time.Until(expires).Seconds()),
 	})
 }
 
-func logout(sessions session.Store) echo.HandlerFunc {
+// logout 只是让浏览器丢弃 cookie
+func logout() echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		if err := sessions.Delete(c.Request().Context(), auth.Token(c)); err != nil {
-			return httpx.Fail(c, err, "注销会话失败")
-		}
 		// 让浏览器立刻丢弃 cookie：值清空 + MaxAge<0。
 		c.SetCookie(&http.Cookie{
-			Name:     session.LoginCookieName,
+			Name:     token.CookieName,
 			Value:    "",
 			Path:     "/",
 			HttpOnly: true,
@@ -215,17 +202,14 @@ func logout(sessions session.Store) echo.HandlerFunc {
 	}
 }
 
-// me 是"验证登录态"的接口，也是 cookie 是否生效的探针。
-// 登录检查已经由 auth.RequireLogin 完成，这里只管查用户。
-func me(db *gorm.DB, sessions session.Store) echo.HandlerFunc {
+// 验证登录
+func me(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
 
 		u, err := gorm.G[User](db).Where("id = ?", auth.UserID(c)).First(ctx)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// 用户被删了但会话还在：当未登录处理，顺手清掉这条会话。
-				_ = sessions.Delete(ctx, auth.Token(c))
 				return c.JSON(http.StatusUnauthorized, map[string]string{"error": "用户不存在"})
 			}
 			return httpx.Fail(c, err, "查询用户失败")

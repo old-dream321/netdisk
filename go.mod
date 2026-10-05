@@ -3,6 +3,7 @@ module netdisk
 go 1.27.1
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/labstack/echo/v5 v5.4.0
 	golang.org/x/crypto v0.57.0
 	gopkg.in/yaml.v3 v3.0.1
