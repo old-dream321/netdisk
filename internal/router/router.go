@@ -16,8 +16,9 @@ import (
 	"netdisk/pkg/token"
 )
 
-// webDir 是前端静态页面目录（相对进程运行目录）。
-const webDir = "web"
+// frontendDir 是前端静态页面目录（相对进程运行目录）。
+// 前端源码在 web/，构建产物输出到 web/dist（cd web && npm run build）。
+const frontendDir = "web/dist"
 
 type Deps struct {
 	DB         *gorm.DB
@@ -51,11 +52,11 @@ func New(deps Deps) *echo.Echo {
 	share.RegisterPublicRoutes(e, deps.DB, deps.StorageDir)
 
 	// 前端页面。用相对路径，和 config.yaml、存储目录的约定一致；
-	// 找不到 web 目录时只提供 API，不影响后端本身。
-	if info, err := os.Stat(webDir); err == nil && info.IsDir() {
-		e.Static("/", webDir)
+	// 找不到 web2/dist 构建产物时只提供 API，不影响后端本身。
+	if info, err := os.Stat(frontendDir); err == nil && info.IsDir() {
+		e.Static("/", frontendDir)
 	} else {
-		slog.Warn("未找到前端静态目录，跳过网页挂载", "dir", webDir)
+		slog.Warn("未找到前端构建产物，跳过网页挂载（可执行 cd web2 && npm run build）", "dir", frontendDir)
 	}
 
 	return e

@@ -7,3 +7,5 @@
 /config.yaml
 /sessions.json
 /storage
+/web/node_modules
+node_modules/
