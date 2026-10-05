@@ -106,8 +106,17 @@ func serve(db *gorm.DB, storageDir string) echo.HandlerFunc {
 		// 下载走同一个路径，只是多一个开关
 		if c.QueryParam("download") == "1" {
 			if res.Target.Type != file.TypeFile {
-				// 打包下载整个目录（zip）以后做，入口就留在这里。
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "暂不支持下载整个目录"})
+				// 目录：流式打包成 zip。打包逻辑和 /api/files/:id/zip 共用，
+				// 包括"开始写之后失败只能掐断连接"那套约定。
+				wrote, err := file.StreamZipDir(c, db, res.Share.OwnerID, res.Target, storageDir)
+				if err != nil {
+					if wrote {
+						c.Logger().Error("打包分享目录中途失败", "err", err, "dir_id", res.Target.ID)
+						panic(http.ErrAbortHandler)
+					}
+					return httpx.Fail(c, err, "打包分享目录失败")
+				}
+				return nil
 			}
 			return file.ServeObject(c, storageDir, res.Target)
 		}

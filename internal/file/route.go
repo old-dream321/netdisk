@@ -38,7 +38,9 @@ func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer, storageDir
 	g.GET("/:id/download", download(db, storageDir))
 	// HEAD 和 GET 共用同一个 handler。http.ServeContent 自己认得 HEAD，很神奇（
 	g.HEAD("/:id/download", download(db, storageDir))
-	g.PATCH("/:id", update(db))              // 改名 / 移动
+	g.PATCH("/:id", update(db)) // 改名 / 移动
+	// 打包下载目录。不注册 HEAD：流式打包给不出 Content-Length，也不支持 Range（边压边发，没法 seek）
+	g.GET("/:id/zip", zipDir(db, storageDir))
 	g.DELETE("/:id", remove(db, storageDir)) // 默认软删除（进回收站），?permanent=true 为彻底删除
 	g.POST("/:id/restore", restore(db))      // 从回收站恢复
 }
@@ -148,6 +150,42 @@ func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不可用"})
 		}
 		return ServeObject(c, storageDir, f)
+	}
+}
+
+// zipDir 打包下载一个目录（流式，边遍历边压）。
+func zipDir(db *gorm.DB, storageDir string) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		ctx := c.Request().Context()
+		ownerID := auth.UserID(c)
+
+		id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的文件 id"})
+		}
+
+		dir, err := gorm.G[File](db).Where("id = ? AND owner_id = ?", id, ownerID).First(ctx)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": "文件不存在"})
+			}
+			return httpx.Fail(c, err, "查询文件失败")
+		}
+		if dir.Type != TypeDir || dir.Status != StatusNormal {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "只能打包下载目录"})
+		}
+
+		wrote, err := StreamZipDir(c, db, ownerID, dir, storageDir)
+		if err != nil {
+			if wrote {
+				// 响应体已经开始写了，状态码改不了：掐断连接，让客户端明确知道失败，
+				// 而不是拿一个残缺的压缩包（详见 StreamZipDir 的注释）。
+				c.Logger().Error("打包目录中途失败", "err", err, "dir_id", dir.ID)
+				panic(http.ErrAbortHandler)
+			}
+			return httpx.Fail(c, err, "打包目录失败")
+		}
+		return nil
 	}
 }
 
