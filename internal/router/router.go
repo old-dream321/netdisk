@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
@@ -14,6 +15,9 @@ import (
 	"netdisk/internal/user"
 	"netdisk/pkg/token"
 )
+
+// webDir 是前端静态页面目录（相对进程运行目录）。
+const webDir = "web"
 
 type Deps struct {
 	DB         *gorm.DB
@@ -45,6 +49,14 @@ func New(deps Deps) *echo.Echo {
 	// 分享分两组：需要登录的挂 /api/shares
 	share.RegisterRoutes(api.Group("/shares"), deps.DB, deps.Signer)
 	share.RegisterPublicRoutes(e, deps.DB, deps.StorageDir)
+
+	// 前端页面。用相对路径，和 config.yaml、存储目录的约定一致；
+	// 找不到 web 目录时只提供 API，不影响后端本身。
+	if info, err := os.Stat(webDir); err == nil && info.IsDir() {
+		e.Static("/", webDir)
+	} else {
+		slog.Warn("未找到前端静态目录，跳过网页挂载", "dir", webDir)
+	}
 
 	return e
 }

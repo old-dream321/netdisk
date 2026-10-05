@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -96,6 +98,19 @@ func create(db *gorm.DB) echo.HandlerFunc {
 
 func serve(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
+		// 浏览器直接打开分享链接时，跳到前端查看页展示；
+		// 程序化访问（curl / Accept: application/json）和下载（download=1）保持原行为。
+		// 浏览器导航请求会带 text/html，据此区分。
+		if c.Request().Method == http.MethodGet &&
+			c.QueryParam("download") != "1" &&
+			strings.Contains(c.Request().Header.Get(echo.HeaderAccept), "text/html") {
+			target := "/share.html?token=" + url.QueryEscape(c.Param("token"))
+			if sub := strings.Trim(c.Param("*"), "/"); sub != "" {
+				target += "&path=" + url.QueryEscape(sub)
+			}
+			return c.Redirect(http.StatusFound, target)
+		}
+
 		ctx := c.Request().Context()
 
 		res, err := resolve(ctx, db, c.Param("token"), c.Param("*"))
