@@ -63,6 +63,13 @@ body {
   z-index: 1;
 }
 
+.auth-theme-toggle {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 2;
+}
+
 .auth-card .ant-card-body {
   padding: 34px 32px 26px;
 }
@@ -241,6 +248,25 @@ body {
   flex-wrap: wrap;
 }
 
+/* 批量操作栏：有选中项时替换面包屑那一行 */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.batch-bar .batch-count {
+  font-weight: 600;
+  color: rgba(0, 0, 0, 0.88);
+}
+
+.batch-bar .batch-cancel {
+  margin-left: auto;
+  color: #64748b;
+}
+
 .crumb-current {
   font-weight: 600;
   color: rgba(0, 0, 0, 0.88);
@@ -303,6 +329,73 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 文件在线预览弹窗 */
+.preview-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.preview-title-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-title-size {
+  flex: none;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.preview-body {
+  display: grid;
+  place-items: center;
+  min-height: 160px;
+  max-height: 66vh;
+  overflow: auto;
+  padding: 6px 2px;
+}
+
+.preview-body img,
+.preview-body video {
+  max-width: 100%;
+  max-height: 62vh;
+  border-radius: 10px;
+}
+
+.preview-body audio {
+  width: min(460px, 100%);
+}
+
+.preview-body .ant-spin-nested-loading {
+  width: 100%;
+}
+
+.preview-text {
+  width: 100%;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
+  padding: 14px 16px;
+  background: #f8fafc;
+  border: 1px solid #eef1f6;
+  border-radius: 12px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: #334155;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.preview-unsupported {
+  color: #94a3b8;
+  padding: 40px 0;
 }
 
 /* 拖拽上传区域：平时像普通面板，拖入时高亮 */
@@ -478,4 +571,62 @@ body {
 /* 无 href 的链接（点击触发操作）显示手型光标 */
 a:not([href]) {
   cursor: pointer;
+}
+
+/* ================= 深色模式 ================= */
+
+[data-theme='dark'] body {
+  background: #141414;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+[data-theme='dark'] .app-header {
+  background: #141414;
+  border-bottom-color: #303030;
+}
+
+[data-theme='dark'] .app-sider {
+  border-right-color: #303030;
+}
+
+[data-theme='dark'] .storage-card {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: #303030;
+}
+
+[data-theme='dark'] .user-chip:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme='dark'] .batch-bar .batch-count,
+[data-theme='dark'] .crumb-current {
+  color: rgba(255, 255, 255, 0.88);
+}
+
+[data-theme='dark'] .batch-bar .batch-cancel {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+[data-theme='dark'] .table-foot {
+  color: rgba(255, 255, 255, 0.45);
+  border-top-color: #303030;
+}
+
+[data-theme='dark'] .cell-name-arrow {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+[data-theme='dark'] .preview-text {
+  background: #1f1f1f;
+  border-color: #303030;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+[data-theme='dark'] .drop-area .ant-upload-drag-hover {
+  background: rgba(99, 102, 241, 0.12);
+}
+
+[data-theme='dark'] .auth-page,
+[data-theme='dark'] .share-page {
+  background: linear-gradient(160deg, #1a1d2e 0%, #12141f 45%, #221627 100%);
 }

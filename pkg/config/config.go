@@ -49,9 +49,7 @@ type TrashConfig struct {
 	Sweep time.Duration `yaml:"sweep"`
 }
 
-// LogConfig 控制日志级别。
 type LogConfig struct {
-	// Level 取 debug / info / warn / error
 	Level string `yaml:"level"`
 }
 
@@ -115,7 +113,7 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// 补默认值。返回值表示"配置被改动了，需要写回文件"
+// 补默认值。返回值表示需要写回文件
 func (c *Config) normalize() bool {
 	def := Default()
 	changed := false

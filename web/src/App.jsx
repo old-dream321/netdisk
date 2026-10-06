@@ -13,6 +13,7 @@ import {
   Segmented,
   Space,
   Spin,
+  Tooltip,
   Typography,
 } from 'antd';
 import {
@@ -24,7 +25,9 @@ import {
   LockOutlined,
   LogoutOutlined,
   MailOutlined,
+  MoonOutlined,
   ReloadOutlined,
+  SunOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { api, fmtSize } from './api.js';
@@ -35,7 +38,7 @@ import TrashView from './TrashView.jsx';
 const { Sider, Header, Content } = Layout;
 const { Text } = Typography;
 
-export default function App() {
+export default function App({ mode, onToggleMode }) {
   const [user, setUser] = useState(undefined); // undefined=检查中, null=未登录
 
   useEffect(() => {
@@ -50,14 +53,14 @@ export default function App() {
     );
   }
   if (!user) {
-    return <AuthScreen onSuccess={setUser} />;
+    return <AuthScreen onSuccess={setUser} mode={mode} onToggleMode={onToggleMode} />;
   }
-  return <Shell user={user} onUserChange={setUser} />;
+  return <Shell user={user} onUserChange={setUser} mode={mode} onToggleMode={onToggleMode} />;
 }
 
 /* ---------------- 登录 / 注册 ---------------- */
 
-function AuthScreen({ onSuccess }) {
+function AuthScreen({ onSuccess, mode: themeMode, onToggleMode }) {
   const { message } = AntApp.useApp();
   const [mode, setMode] = useState('login');
   const [loading, setLoading] = useState(false);
@@ -87,6 +90,15 @@ function AuthScreen({ onSuccess }) {
 
   return (
     <div className="auth-page">
+      <Tooltip title={themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}>
+        <Button
+          className="auth-theme-toggle"
+          type="text"
+          shape="circle"
+          icon={themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+          onClick={onToggleMode}
+        />
+      </Tooltip>
       <div className="auth-blob auth-blob-a" />
       <div className="auth-blob auth-blob-b" />
       <Card className="auth-card">
@@ -145,7 +157,7 @@ const VIEW_META = {
   trash: { label: '回收站', icon: <DeleteOutlined /> },
 };
 
-function Shell({ user, onUserChange }) {
+function Shell({ user, onUserChange, mode, onToggleMode }) {
   const [view, setView] = useState('files');
   const [tick, setTick] = useState(0);
 
@@ -203,6 +215,12 @@ function Shell({ user, onUserChange }) {
         <Header className="app-header">
           <div className="header-title">{VIEW_META[view].label}</div>
           <Space size={12}>
+            <Tooltip title={mode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}>
+              <Button
+                icon={mode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+                onClick={onToggleMode}
+              />
+            </Tooltip>
             <Button icon={<ReloadOutlined />} onClick={() => setTick((t) => t + 1)}>
               刷新
             </Button>

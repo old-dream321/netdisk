@@ -13,7 +13,6 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"netdisk/internal/auth"
 	"netdisk/internal/user"
@@ -32,11 +31,11 @@ const (
 func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer, storageDir string) {
 	g = g.Group("", auth.RequireLogin(signer))
 
-	g.POST("/list", list(db)) // 列表：POST + JSON body
+	g.POST("/list", list(db))
 	g.POST("/upload", upload(db, storageDir))
 	g.POST("/createdir", createDir(db))
 	g.GET("/:id/download", download(db, storageDir))
-	// HEAD 和 GET 共用同一个 handler。http.ServeContent 自己认得 HEAD，很神奇（
+	// HEAD 和 GET 可以共用同一个 handler，很神奇（
 	g.HEAD("/:id/download", download(db, storageDir))
 	g.PATCH("/:id", update(db)) // 改名 / 移动
 	// 打包下载目录。不注册 HEAD：流式打包给不出 Content-Length，也不支持 Range（边压边发，没法 seek）
@@ -44,6 +43,8 @@ func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer, storageDir
 	g.DELETE("/:id", remove(db, storageDir)) // 默认软删除（进回收站），?permanent=true 为彻底删除
 	g.POST("/:id/restore", restore(db))      // 从回收站恢复
 }
+
+// ---------上传下载-----------
 
 func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
@@ -153,7 +154,7 @@ func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	}
 }
 
-// zipDir 打包下载一个目录（流式，边遍历边压）。
+// 打包下载一个目录（流式，边遍历边压）
 func zipDir(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
@@ -189,9 +190,11 @@ func zipDir(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	}
 }
 
-// 用指针是区分"没传"和"传了零值"：
-//   - ParentID 为 nil = 该用户的全部文件；为 0 = 只看根目录；
-//   - Status 为 nil = 只看正常文件（1），传 2 就是看回收站。
+// ---------列表，创建文件夹-----------
+
+// 用指针可以区分"没传"和"传了零值"
+// - ParentID 为 nil = 该用户的全部文件；为 0 = 只看根目录；
+// - Status 为 nil = 只看正常文件（1），传 2 就是看回收站。
 type listRequest struct {
 	ParentID *uint64 `json:"parent_id"`
 	Status   *int8   `json:"status"`
@@ -218,7 +221,7 @@ func list(db *gorm.DB) echo.HandlerFunc {
 
 		status := StatusNormal
 		if req.Status != nil {
-			if *req.Status < StatusNormal || *req.Status > StatusDeleted {
+			if *req.Status < StatusNormal || *req.Status > StatusTrash {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": "非法的 status"})
 			}
 			status = *req.Status
@@ -273,8 +276,6 @@ func createDir(db *gorm.DB) echo.HandlerFunc {
 			return writeParentCheckError(c, err)
 		}
 
-		// 同级不允许重名（把文件也算进来，避免"同名文件和目录共存"）。
-		// 具体规则见 nameTaken：回收站里的条目不占名字。
 		taken, err := nameTaken(ctx, db, ownerID, req.ParentID, req.Name, 0)
 		if err != nil {
 			return httpx.Fail(c, err, "检查同名条目失败")
@@ -297,32 +298,28 @@ func createDir(db *gorm.DB) echo.HandlerFunc {
 	}
 }
 
-func removefile(ctx context.Context, db *gorm.DB, fileid uint64) error {
+// ---------删除恢复-----------
+
+func removefile(ctx context.Context, db *gorm.DB, ownerID uint64, fileid uint64) error {
 	file, err := gorm.G[File](db).Where("id = ?", fileid).First(ctx)
 	if err != nil {
 		return err
 	}
-	if file.Status == StatusTrash || file.Status == StatusDeleted {
-		return nil // 已经在回收站或已删除的文件不再处理
-	}
+
+	ids := []uint64{file.ID}
 	if file.Type == TypeDir {
-		// 目录要递归删除：先查出所有子项，再逐个删。
-		children, err := gorm.G[File](db).Where("parent_id = ?", fileid).Find(ctx)
+		descendants, err := collectSubtree(ctx, db, ownerID, file.ID)
 		if err != nil {
 			return fmt.Errorf("查询子项: %w", err)
 		}
-		for _, child := range children {
-			if err := removefile(ctx, db, child.ID); err != nil {
-				return fmt.Errorf("删除子项 %d: %w", child.ID, err)
-			}
+		for _, f := range descendants {
+			ids = append(ids, f.ID)
 		}
 	}
 
-	file.Status = StatusTrash
-	if _, err := gorm.G[File](db).
-		Where("id = ?", fileid).
-		Set(clause.Assignments(map[string]any{"status": file.Status, "deleted_at": time.Now()})).
-		Update(ctx); err != nil {
+	if _, err := gorm.G[map[string]any](db).Table("files").
+		Where("id IN ? AND status <> ?", ids, StatusTrash).
+		Updates(ctx, map[string]any{"status": StatusTrash, "deleted_at": time.Now()}); err != nil {
 		return fmt.Errorf("更新状态: %w", err)
 	}
 	return nil
@@ -363,17 +360,16 @@ func restoreTree(ctx context.Context, db *gorm.DB, ownerID, id uint64) (int, err
 		ids = append(ids, f.ID)
 	}
 
-	n, err := gorm.G[File](db).
+	n, err := gorm.G[map[string]any](db).Table("files").
 		Where("id IN ? AND owner_id = ? AND status = ?", ids, ownerID, StatusTrash).
-		Set(clause.Assignments(map[string]any{"status": StatusNormal, "deleted_at": nil})).
-		Update(ctx)
+		Updates(ctx, map[string]any{"status": StatusNormal, "deleted_at": nil})
 	if err != nil {
 		return 0, fmt.Errorf("恢复状态: %w", err)
 	}
 	return n, nil
 }
 
-// purgeTree 彻底删除 id 及其子孙：先删数据库记录，再清理不再被引用的磁盘对象。
+// 彻底删除 id 及其子孙：先删数据库记录，再清理不再被引用的磁盘对象。
 func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, storageDir string) error {
 	descendants, err := collectSubtree(ctx, db, ownerID, root.ID)
 	if err != nil {
@@ -393,14 +389,13 @@ func purgeTree(ctx context.Context, db *gorm.DB, ownerID uint64, root File, stor
 		}
 	}
 
-	// 一个 DELETE 干掉整棵子树；条件带 owner_id，删不到别人的记录。
 	if _, err := gorm.G[File](db).
 		Where("id IN ? AND owner_id = ?", ids, ownerID).
 		Delete(ctx); err != nil {
 		return fmt.Errorf("删除记录: %w", err)
 	}
 
-	// 确认"全表（包括别人的、回收站里的）没有任何记录还引用它"。
+	// 如果没有引用再删
 	for _, key := range keys {
 		refs, err := gorm.G[File](db).Where("storage_key = ?", key).Count(ctx, "*")
 		if err != nil {
@@ -438,8 +433,7 @@ func remove(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return httpx.Fail(c, err, "查询文件失败")
 		}
 
-		// ?permanent=true 是彻底删除：记录和磁盘对象一起清掉，不可恢复。
-		// 不要求先经过回收站——它就是"直接全删"。
+		// ?permanent=true 是彻底删除
 		if c.QueryParam("permanent") == "true" {
 			if err := purgeTree(ctx, db, ownerID, file, storageDir); err != nil {
 				return httpx.Fail(c, err, "彻底删除失败")
@@ -447,10 +441,10 @@ func remove(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return c.NoContent(http.StatusNoContent)
 		}
 
-		if file.Status == StatusTrash || file.Status == StatusDeleted {
+		if file.Status == StatusTrash {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "文件已在回收站"})
 		}
-		if err := removefile(ctx, db, fileid); err != nil {
+		if err := removefile(ctx, db, ownerID, fileid); err != nil {
 			return httpx.Fail(c, err, "删除文件失败")
 		}
 
@@ -480,8 +474,7 @@ func restore(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "文件不在回收站"})
 		}
 
-		// 上级目录还在回收站时不允许恢复：恢复出来也是一个"看不见"的条目，
-		// 用户在列表里根本找不到它。让他先恢复上级目录。
+		// 上级目录还在回收站时不允许恢复
 		if file.ParentID != 0 {
 			parent, err := gorm.G[File](db).
 				Where("id = ? AND owner_id = ?", file.ParentID, ownerID).First(ctx)
@@ -496,8 +489,6 @@ func restore(db *gorm.DB) echo.HandlerFunc {
 			}
 		}
 
-		// 回收站里的条目不占名字，所以这个名字可能已经被新条目用掉了，
-		// 恢复前必须再查一次，否则会恢复出两个同名的可见条目。
 		taken, err := nameTaken(ctx, db, ownerID, file.ParentID, file.Name, 0)
 		if err != nil {
 			return httpx.Fail(c, err, "检查同名条目失败")
@@ -519,15 +510,13 @@ func restore(db *gorm.DB) echo.HandlerFunc {
 	}
 }
 
+// ---------改名移动-----------
+
 type updateRequest struct {
 	Name     *string `json:"name"`      // nil = 不改名
 	ParentID *uint64 `json:"parent_id"` // nil = 不移动；&0 = 移到根目录
 }
 
-// update 处理 PATCH /api/files/:id：改名、移动，或者两者一起。
-//
-// 两个字段都是可选的，用指针是为了区分"没传"和"传了零值"——
-// parent_id=0 是合法且有意义的（移到根目录），不能和"没传"混为一谈。
 func update(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
@@ -578,7 +567,7 @@ func update(db *gorm.DB) echo.HandlerFunc {
 			}
 		}
 
-		// 重名检查必须排除自己，否则"改成现在这个名字"会误判成冲突。
+		// 重名检查必须排除自己
 		taken, err := nameTaken(ctx, db, ownerID, newParentID, newName, file.ID)
 		if err != nil {
 			return httpx.Fail(c, err, "检查同名条目失败")
@@ -587,10 +576,10 @@ func update(db *gorm.DB) echo.HandlerFunc {
 			return c.JSON(http.StatusConflict, map[string]string{"error": errNameTaken.Error()})
 		}
 
-		if _, err := gorm.G[File](db).
+		// 用 map 更新，要写零值
+		if _, err := gorm.G[map[string]any](db).Table("files").
 			Where("id = ? AND owner_id = ?", file.ID, ownerID).
-			Set(clause.Assignments(map[string]any{"name": newName, "parent_id": newParentID})). // 这个可以写零值
-			Update(ctx); err != nil {
+			Updates(ctx, map[string]any{"name": newName, "parent_id": newParentID}); err != nil {
 			return httpx.Fail(c, err, "更新文件失败")
 		}
 

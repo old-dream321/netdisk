@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	// defaultQuota 新用户的默认配额：1GiB。
+	// 新用户的默认配额：1GiB。
 	defaultQuota int64 = 1 << 30
-	// maxUsernameLen 用户名最大长度（按 rune 算，避免中文被按字节"缩短"）。
+	// =用户名最大长度
 	maxUsernameLen = 64
 )
 

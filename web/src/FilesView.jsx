@@ -24,6 +24,7 @@ import {
   DeleteOutlined,
   DownloadOutlined,
   EditOutlined,
+  EyeOutlined,
   FolderAddOutlined,
   FolderOpenOutlined,
   FolderOutlined,
@@ -34,24 +35,24 @@ import {
 import dayjs from 'dayjs';
 import { api, copyText, download, fmtSize, uploadFile } from './api';
 import { FileTypeIcon } from './fileMeta';
+import FilePreview, { previewKind } from './FilePreview.jsx';
 
 const { Text } = Typography;
 
-/* 构建"移动"用的目录树：目标是目录时，需要排除自身与所有子孙目录 */
-function buildMoveTree(dirs, moving) {
-  const banned = new Set([moving.id]);
-  if (moving.type === 2) {
-    let frontier = [moving.id];
-    while (frontier.length) {
-      const next = [];
-      for (const d of dirs) {
-        if (!banned.has(d.id) && frontier.includes(d.parent_id)) {
-          banned.add(d.id);
-          next.push(d.id);
-        }
+/* 构建"移动"用的目录树：被移动的目录需要排除自身与所有子孙目录（支持批量） */
+function buildMoveTree(dirs, movingList) {
+  const list = Array.isArray(movingList) ? movingList : [movingList];
+  const banned = new Set(list.map((m) => m.id));
+  let frontier = list.filter((m) => m.type === 2).map((m) => m.id);
+  while (frontier.length) {
+    const next = [];
+    for (const d of dirs) {
+      if (!banned.has(d.id) && frontier.includes(d.parent_id)) {
+        banned.add(d.id);
+        next.push(d.id);
       }
-      frontier = next;
     }
+    frontier = next;
   }
   const byParent = new Map();
   for (const d of dirs) {
@@ -89,8 +90,8 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
   const [renameTarget, setRenameTarget] = useState(null);
   const [renameBusy, setRenameBusy] = useState(false);
   const [renameForm] = Form.useForm();
-  // 移动
-  const [moveTarget, setMoveTarget] = useState(null);
+  // 移动（数组，支持批量移动）
+  const [moveTargets, setMoveTargets] = useState(null);
   const [moveBusy, setMoveBusy] = useState(false);
   const [moveLoading, setMoveLoading] = useState(false);
   const [moveTree, setMoveTree] = useState([]);
@@ -102,6 +103,10 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
   const [shareExp, setShareExp] = useState('7');
   const [shareDate, setShareDate] = useState(null);
   const [shareLink, setShareLink] = useState('');
+  // 预览
+  const [previewItem, setPreviewItem] = useState(null);
+  // 多选
+  const [selectedKeys, setSelectedKeys] = useState([]);
 
   const load = useCallback(
     async (id) => {
@@ -162,8 +167,14 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
 
   /* ---------------- 操作 ---------------- */
 
-  const enterDir = (record) => setStack((s) => [...s, { id: record.id, name: record.name }]);
-  const gotoCrumb = (index) => setStack((s) => s.slice(0, index + 1));
+  const enterDir = (record) => {
+    setStack((s) => [...s, { id: record.id, name: record.name }]);
+    setSelectedKeys([]);
+  };
+  const gotoCrumb = (index) => {
+    setStack((s) => s.slice(0, index + 1));
+    setSelectedKeys([]);
+  };
 
   const submitMkdir = async () => {
     let values;
@@ -215,15 +226,17 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
     }
   };
 
-  const openMove = async (record) => {
-    setMoveTarget(record);
-    setMoveKey(String(record.parent_id));
+  const openMove = async (list) => {
+    const targets = Array.isArray(list) ? list : [list];
+    if (!targets.length) return;
+    setMoveTargets(targets);
+    setMoveKey(String(targets[0].parent_id));
     setMoveTree([]);
     setMoveLoading(true);
     try {
       const data = await api.listFiles(undefined); // 不带 parent_id：返回全部文件
       const dirs = ((data && data.items) || []).filter((x) => x.type === 2);
-      setMoveTree(buildMoveTree(dirs, record));
+      setMoveTree(buildMoveTree(dirs, targets));
     } catch (e) {
       message.error('加载目录失败：' + e.message);
     } finally {
@@ -233,21 +246,28 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
 
   const submitMove = async () => {
     const target = Number(moveKey);
-    if (target === moveTarget.parent_id) {
-      setMoveTarget(null);
+    const need = moveTargets.filter((t) => t.parent_id !== target); // 已在目标目录的跳过
+    if (!need.length) {
+      setMoveTargets(null);
       return;
     }
     setMoveBusy(true);
-    try {
-      await api.move(moveTarget.id, target);
-      message.success('已移动');
-      setMoveTarget(null);
-      load(currentId);
-    } catch (e) {
-      message.error(e.message);
-    } finally {
-      setMoveBusy(false);
+    let ok = 0;
+    let fail = 0;
+    for (const t of need) {
+      try {
+        await api.move(t.id, target);
+        ok++;
+      } catch {
+        fail++;
+      }
     }
+    setMoveBusy(false);
+    setMoveTargets(null);
+    if (ok) message.success(need.length > 1 ? `已移动 ${ok} 项` : '已移动');
+    if (fail) message.error(`${fail} 项移动失败`);
+    setSelectedKeys([]);
+    load(currentId);
   };
 
   const openShare = (record) => {
@@ -296,6 +316,40 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
     }
   };
 
+  /* ---------------- 批量操作 ---------------- */
+
+  const selectedItems = useMemo(
+    () => items.filter((it) => selectedKeys.includes(it.id)),
+    [items, selectedKeys],
+  );
+
+  const batchDownload = () => {
+    selectedItems.forEach((it, i) => {
+      // 错开触发，避免浏览器把连续多个下载拦截
+      setTimeout(() => {
+        download(it.type === 2 ? `/api/files/${it.id}/zip` : `/api/files/${it.id}/download`);
+      }, i * 400);
+    });
+    message.success(`开始下载 ${selectedItems.length} 项`);
+  };
+
+  const batchTrash = async () => {
+    let ok = 0;
+    let fail = 0;
+    for (const it of selectedItems) {
+      try {
+        await api.remove(it.id);
+        ok++;
+      } catch {
+        fail++;
+      }
+    }
+    if (ok) message.success(`已移入回收站 ${ok} 项`);
+    if (fail) message.error(`${fail} 项操作失败`);
+    setSelectedKeys([]);
+    load(currentId);
+  };
+
   /* ---------------- 渲染 ---------------- */
 
   const columns = [
@@ -309,6 +363,10 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
             <a className="cell-name-link" onClick={() => enterDir(record)}>
               {record.name}
               <RightOutlined className="cell-name-arrow" />
+            </a>
+          ) : previewKind(record) ? (
+            <a className="cell-name-link" title="点击预览" onClick={() => setPreviewItem(record)}>
+              {record.name}
             </a>
           ) : (
             <span className="cell-name-text">{record.name}</span>
@@ -329,6 +387,11 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
       align: 'right',
       render: (_, record) => (
         <Space size={0} onClick={(e) => e.stopPropagation()}>
+          {record.type === 1 && previewKind(record) && (
+            <Tooltip title="预览">
+              <Button type="text" icon={<EyeOutlined />} onClick={() => setPreviewItem(record)} />
+            </Tooltip>
+          )}
           <Tooltip title={record.type === 2 ? '打包下载' : '下载'}>
             <Button
               type="text"
@@ -364,34 +427,63 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
 
   return (
     <div className="files-view">
-      <div className="files-toolbar">
-        <Breadcrumb
-          items={stack.map((s, i) => ({
-            title:
-              i === stack.length - 1 ? (
-                <span className="crumb-current">{s.name}</span>
-              ) : (
-                <a onClick={() => gotoCrumb(i)}>{s.name}</a>
-              ),
-          }))}
-        />
-        <Space>
-          <Button
-            icon={<FolderAddOutlined />}
-            onClick={() => {
-              mkdirForm.resetFields();
-              setMkdirOpen(true);
-            }}
-          >
-            新建文件夹
-          </Button>
-          <Upload {...uploadProps}>
-            <Button type="primary" icon={<UploadOutlined />}>
-              上传文件
+      {selectedKeys.length > 0 ? (
+        <div className="batch-bar">
+          <span className="batch-count">已选 {selectedKeys.length} 项</span>
+          <Space size={8} wrap>
+            <Button size="small" icon={<DownloadOutlined />} onClick={batchDownload}>
+              下载
             </Button>
-          </Upload>
-        </Space>
-      </div>
+            <Button size="small" icon={<FolderOpenOutlined />} onClick={() => openMove(selectedItems)}>
+              移动
+            </Button>
+            <Popconfirm
+              title="批量删除"
+              description={`将选中的 ${selectedKeys.length} 项移入回收站？`}
+              okText="移入回收站"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={batchTrash}
+            >
+              <Button size="small" danger icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+          <Button size="small" type="text" className="batch-cancel" onClick={() => setSelectedKeys([])}>
+            取消选择
+          </Button>
+        </div>
+      ) : (
+        <div className="files-toolbar">
+          <Breadcrumb
+            items={stack.map((s, i) => ({
+              title:
+                i === stack.length - 1 ? (
+                  <span className="crumb-current">{s.name}</span>
+                ) : (
+                  <a onClick={() => gotoCrumb(i)}>{s.name}</a>
+                ),
+            }))}
+          />
+          <Space>
+            <Button
+              icon={<FolderAddOutlined />}
+              onClick={() => {
+                mkdirForm.resetFields();
+                setMkdirOpen(true);
+              }}
+            >
+              新建文件夹
+            </Button>
+            <Upload {...uploadProps}>
+              <Button type="primary" icon={<UploadOutlined />}>
+                上传文件
+              </Button>
+            </Upload>
+          </Space>
+        </div>
+      )}
 
       <Upload.Dragger {...uploadProps} openFileDialogOnClick={false} className="drop-area">
         <Card className="table-card" styles={{ body: { padding: 0 } }}>
@@ -402,6 +494,10 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
             columns={columns}
             dataSource={items}
             pagination={false}
+            rowSelection={{
+              selectedRowKeys: selectedKeys,
+              onChange: (keys) => setSelectedKeys(keys),
+            }}
             locale={{
               emptyText: (
                 <Empty
@@ -483,9 +579,15 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
       </Modal>
 
       <Modal
-        title={moveTarget ? `移动「${moveTarget.name}」` : '移动'}
-        open={!!moveTarget}
-        onCancel={() => setMoveTarget(null)}
+        title={
+          moveTargets
+            ? moveTargets.length > 1
+              ? `移动 ${moveTargets.length} 项`
+              : `移动「${moveTargets[0].name}」`
+            : '移动'
+        }
+        open={!!moveTargets}
+        onCancel={() => setMoveTargets(null)}
         onOk={submitMove}
         confirmLoading={moveBusy}
         okText="移动到此处"
@@ -570,6 +672,16 @@ export default function FilesView({ refreshToken, onQuotaChange }) {
           </>
         )}
       </Modal>
+
+      {previewItem && (
+        <FilePreview
+          name={previewItem.name}
+          size={previewItem.size}
+          kind={previewKind(previewItem)}
+          url={`/api/files/${previewItem.id}/download`}
+          onClose={() => setPreviewItem(null)}
+        />
+      )}
     </div>
   );
 }

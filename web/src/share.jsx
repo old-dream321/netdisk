@@ -13,12 +13,22 @@ import {
   Spin,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { ClockCircleOutlined, CloudFilled, CopyOutlined, DownloadOutlined } from '@ant-design/icons';
+import {
+  ClockCircleOutlined,
+  CloudFilled,
+  CopyOutlined,
+  DownloadOutlined,
+  MoonOutlined,
+  SunOutlined,
+} from '@ant-design/icons';
 import zhCN from 'antd/locale/zh_CN';
 import { copyText, fmtSize, fmtTime } from './api';
 import { FileTypeIcon } from './fileMeta';
+import FilePreview, { kindByName } from './FilePreview.jsx';
+import { applyMode, initTheme, saveMode, themeConfig } from './theme.js';
 import 'antd/dist/reset.css';
 import './styles.css';
 
@@ -26,7 +36,7 @@ const { Text, Title } = Typography;
 
 /* ---------------- 内容 ---------------- */
 
-function ShareContent() {
+function ShareContent({ mode, onToggleMode }) {
   const token = new URLSearchParams(location.search).get('token') || '';
   const [pathSegs, setPathSegs] = useState(() =>
     (new URLSearchParams(location.search).get('path') || '').split('/').filter(Boolean),
@@ -112,6 +122,15 @@ function ShareContent() {
         <Tag color="geekblue" style={{ marginLeft: 10 }}>
           {data && data.type === 'dir' ? '文件夹分享' : '文件分享'}
         </Tag>
+        <Tooltip title={mode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}>
+          <Button
+            type="text"
+            shape="circle"
+            style={{ marginLeft: 'auto' }}
+            icon={mode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+            onClick={onToggleMode}
+          />
+        </Tooltip>
       </div>
       <div className="share-body">
         {status === 'loading' && (
@@ -147,11 +166,30 @@ function ShareContent() {
 
 function ShareFile({ data }) {
   const { message } = AntApp.useApp();
-  const ext = (data.name || '').toLowerCase();
-  const canPreview = Number(data.size) <= 80 * 1024 * 1024;
-  const isImg = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/.test(ext);
-  const isVid = /\.(mp4|webm|mov|m4v)$/.test(ext);
-  const isAud = /\.(mp3|wav|flac|aac|ogg|m4a)$/.test(ext);
+  const kind = kindByName(data.name, data.size);
+  const [text, setText] = useState(null);
+  const [textLoading, setTextLoading] = useState(false);
+
+  useEffect(() => {
+    if (kind !== 'text') return undefined;
+    let aborted = false;
+    setTextLoading(true);
+    setText(null);
+    fetch(data.download_url, { credentials: 'same-origin' })
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then((t) => {
+        if (!aborted) setText(t);
+      })
+      .catch(() => {
+        if (!aborted) setText('（无法加载文件内容，请下载查看）');
+      })
+      .finally(() => {
+        if (!aborted) setTextLoading(false);
+      });
+    return () => {
+      aborted = true;
+    };
+  }, [kind, data.download_url]);
 
   const copy = async () => {
     if (await copyText(location.href)) message.success('链接已复制');
@@ -170,19 +208,26 @@ function ShareFile({ data }) {
           {data.expires_at ? fmtTime(data.expires_at) + ' 到期' : '永久有效'}
         </Text>
       </div>
-      {canPreview && isImg && (
+      {kind === 'image' && (
         <div className="share-preview">
           <Image src={data.download_url} style={{ maxHeight: 420, borderRadius: 12 }} />
         </div>
       )}
-      {canPreview && isVid && (
+      {kind === 'video' && (
         <div className="share-preview">
           <video controls preload="metadata" src={data.download_url} />
         </div>
       )}
-      {canPreview && isAud && (
+      {kind === 'audio' && (
         <div className="share-preview">
           <audio controls preload="metadata" src={data.download_url} />
+        </div>
+      )}
+      {kind === 'text' && (
+        <div className="share-preview">
+          <Spin spinning={textLoading}>
+            <pre className="preview-text">{text ?? ''}</pre>
+          </Spin>
         </div>
       )}
       <div className="share-actions">
@@ -208,6 +253,7 @@ function ShareFile({ data }) {
 
 function ShareDir({ data, rootName, pathSegs, onNavigate, zipUrl }) {
   const items = data.items || [];
+  const [preview, setPreview] = useState(null);
   const crumbs = [{ name: rootName || '分享内容', depth: 0 }].concat(
     pathSegs.map((s, i) => ({ name: s, depth: i + 1 })),
   );
@@ -215,16 +261,21 @@ function ShareDir({ data, rootName, pathSegs, onNavigate, zipUrl }) {
   const columns = [
     {
       title: '名称',
-      render: (_, r) => (
-        <Space>
-          <FileTypeIcon item={{ name: r.name, type: r.type === 'dir' ? 2 : 1 }} size={34} />
-          {r.type === 'dir' ? (
-            <a onClick={() => onNavigate(pathSegs.concat([r.name]))}>{r.name}</a>
-          ) : (
-            <Text>{r.name}</Text>
-          )}
-        </Space>
-      ),
+      render: (_, r) => {
+        const kind = r.type === 'dir' ? null : kindByName(r.name, r.size);
+        return (
+          <Space>
+            <FileTypeIcon item={{ name: r.name, type: r.type === 'dir' ? 2 : 1 }} size={34} />
+            {r.type === 'dir' ? (
+              <a onClick={() => onNavigate(pathSegs.concat([r.name]))}>{r.name}</a>
+            ) : kind ? (
+              <a onClick={() => setPreview({ name: r.name, size: r.size, kind, url: r.download_url })}>{r.name}</a>
+            ) : (
+              <Text>{r.name}</Text>
+            )}
+          </Space>
+        );
+      },
     },
     {
       title: '大小',
@@ -233,9 +284,20 @@ function ShareDir({ data, rootName, pathSegs, onNavigate, zipUrl }) {
     },
     {
       title: '',
-      width: 100,
+      width: 150,
       align: 'right',
-      render: (_, r) => (r.type === 'dir' ? null : <a href={r.download_url}>下载</a>),
+      render: (_, r) => {
+        if (r.type === 'dir') return null;
+        const kind = kindByName(r.name, r.size);
+        return (
+          <Space size={12}>
+            {kind && (
+              <a onClick={() => setPreview({ name: r.name, size: r.size, kind, url: r.download_url })}>预览</a>
+            )}
+            <a href={r.download_url}>下载</a>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -280,16 +342,33 @@ function ShareDir({ data, rootName, pathSegs, onNavigate, zipUrl }) {
         pagination={false}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="这个文件夹是空的" /> }}
       />
+      {preview && <FilePreview {...preview} onClose={() => setPreview(null)} />}
     </Card>
   );
 }
 
 /* ---------------- 挂载 ---------------- */
 
-ReactDOM.createRoot(document.getElementById('share-root')).render(
-  <ConfigProvider locale={zhCN} theme={{ token: { colorPrimary: '#6366f1', borderRadius: 10 } }}>
-    <AntApp>
-      <ShareContent />
-    </AntApp>
-  </ConfigProvider>,
-);
+function ShareApp() {
+  const [mode, setMode] = useState(initTheme);
+  useEffect(() => {
+    applyMode(mode);
+  }, [mode]);
+
+  const toggleMode = () =>
+    setMode((m) => {
+      const next = m === 'dark' ? 'light' : 'dark';
+      saveMode(next);
+      return next;
+    });
+
+  return (
+    <ConfigProvider locale={zhCN} theme={themeConfig(mode)}>
+      <AntApp>
+        <ShareContent mode={mode} onToggleMode={toggleMode} />
+      </AntApp>
+    </ConfigProvider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('share-root')).render(<ShareApp />);

@@ -17,7 +17,6 @@ const (
 	sweepPause = 50 * time.Millisecond
 )
 
-// StartJanitor 每隔 interval 清理一次"在回收站里待够 ttl"的条目，直到 ctx 被取消。
 func StartJanitor(ctx context.Context, db *gorm.DB, storageDir string, ttl, interval time.Duration) {
 	if interval <= 0 || ttl <= 0 {
 		slog.Warn("回收站清理未启动：保留时长和扫描间隔都必须为正数", "ttl", ttl, "interval", interval)

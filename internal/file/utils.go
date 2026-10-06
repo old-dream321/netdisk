@@ -24,16 +24,12 @@ import (
 	"netdisk/pkg/httpx"
 )
 
-// ObjectPath 把对象 key 映射成存储根目录下的真实路径。
-// 存储目录由调用方传入（来自配置文件），不再在这里偷偷读一次配置。
+// 拼接文件路径
 func ObjectPath(dir, storageKey string) string {
 	return filepath.Join(dir, filepath.FromSlash(storageKey))
 }
 
-// ContentDisposition 生成下载响应的 Content-Disposition 值。
-// 交给标准库 mime.FormatMediaType：非 ASCII 文件名会按 RFC 2231/5987 编码成
-// 扩展形式（filename* 参数），引号、反斜杠等字符也由它负责转义；
-// 值无法表示时返回空串，此时调用方应当跳过设置该头。
+// 生成下载响应的 Content-Disposition 值
 func ContentDisposition(name string) string {
 	return mime.FormatMediaType("attachment", map[string]string{"filename": name})
 }
@@ -63,13 +59,13 @@ func ServeObject(c *echo.Context, storageDir string, f File) error {
 	return nil
 }
 
-// 保存文件到对象存储目录，返回存储 key、文件大小、sha256 摘要。
+// 保存文件到对象存储目录，返回存储 key、文件大小、sha256 摘要
 func saveUpload(dir string, src io.Reader) (storageKey string, size int64, hash string, err error) {
 	if err = os.MkdirAll(dir, 0o755); err != nil {
 		return "", 0, "", fmt.Errorf("创建存储目录: %w", err)
 	}
 
-	// 写到临时文件里，可以防止使用过多内存（io.Copy 会尽量用 32KB 缓冲），也可以防止写到一半就被中断。
+	// 写到临时文件里，可以防止使用过多内存，也可以防止写到一半就被中断。
 	tmp, err := os.CreateTemp(dir, "upload-*")
 	if err != nil {
 		return "", 0, "", fmt.Errorf("创建临时文件: %w", err)
@@ -92,7 +88,7 @@ func saveUpload(dir string, src io.Reader) (storageKey string, size int64, hash 
 	storageKey = filepath.ToSlash(filepath.Join(hash[:2], hash))
 
 	dst := ObjectPath(dir, storageKey)
-	// 如果目标文件已存在，说明内容相同，直接丢掉临时文件即可。
+	// 如果目标文件已存在，说明内容相同，直接丢掉临时文件即可
 	if _, statErr := os.Stat(dst); statErr == nil {
 		return storageKey, size, hash, nil
 	}
@@ -133,7 +129,7 @@ func checkParent(ctx context.Context, db *gorm.DB, ownerID, parentID uint64) err
 	return nil
 }
 
-// 把 checkParent 的错误翻成响应，校验不通过是调用方的问题(400)，查询本身失败是服务端的锅(500)。
+// 判断响应应该是400（请求体有问题）还是500（服务端有问题）
 func writeParentCheckError(c *echo.Context, err error) error {
 	if errors.Is(err, errParentInvalid) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -220,8 +216,6 @@ func checkMoveTarget(ctx context.Context, db *gorm.DB, ownerID uint64, file File
 	return nil
 }
 
-// 把移动目标的校验错误翻成响应：都是调用方输入的问题(400)，
-// 查询本身失败才是服务端的锅(500)。
 func writeMoveError(c *echo.Context, err error) error {
 	if errors.Is(err, errParentInvalid) || errors.Is(err, errMoveToSelf) || errors.Is(err, errMoveToDescendant) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -233,10 +227,9 @@ func writeMoveError(c *echo.Context, err error) error {
 // 思路：前面实现过 collectSubtree，可以直接获取所有的子文件，但是这是扁平的，所以可以直接用这个算 etag
 // 但是重建目录就需要搞清楚文件之间的关系，所以需要先把每个子文件夹对应的文件映射关系处理成 map，再递归遍历
 
-// 返回值里的 wroteBody 告诉调用方响应体开始了没有
+// 如果中途失败，返回值里的 wroteBody 告诉调用方响应体开始了没有，不能返回一个不完整的zip
 //   - false（还在查库阶段就失败了）：照常返回错误，Echo 会给出 500；
-//   - true（已经开始写了）：状态码改不了了，调用方只能 panic(http.ErrAbortHandler)
-//     把连接掐断，让客户端明确知道下载失败。
+//   - true（已经开始写了）：状态码改不了了，调用方只能 panic(http.ErrAbortHandler) 把连接掐断，让客户端明确知道下载失败。
 func StreamZipDir(c *echo.Context, db *gorm.DB, ownerID uint64, dir File, storageDir string) (wroteBody bool, err error) {
 	ctx := c.Request().Context()
 
@@ -283,7 +276,7 @@ func StreamZipDir(c *echo.Context, db *gorm.DB, ownerID uint64, dir File, storag
 		log:        c.Logger(),
 	}
 	if err := tree.write(ctx, dir, dir.Name); err != nil {
-		return true, err // 故意不 Close：见函数注释
+		return true, err
 	}
 	if err := zw.Close(); err != nil {
 		return true, fmt.Errorf("写入 zip 中央目录: %w", err)
@@ -299,18 +292,16 @@ type zipTree struct {
 	log        *slog.Logger
 }
 
-// write 递归写出一个目录及其子项。prefix 是它在 zip 里的路径。
+// 递归写出一个目录及其子项
 func (t *zipTree) write(ctx context.Context, dir File, prefix string) error {
-	// 目录自己也要占一条记录（名字以 / 结尾）：空目录全靠它才不会丢。
-	// 最外层的目录也包括在内，这样解压出来是一整个文件夹，而不是散落一地。
 	if prefix != "" {
+		// 这一步创建可以保留空目录
 		if _, err := t.zw.Create(prefix + "/"); err != nil {
 			return fmt.Errorf("写入目录项 %s: %w", prefix, err)
 		}
 	}
 
 	for _, f := range t.children[dir.ID] {
-		// 客户端断开（或按了取消）就别再压了，不然白读一大片磁盘。
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -334,7 +325,7 @@ func (t *zipTree) writeFile(_ context.Context, f File, name string) error {
 	// 必须先把内容打开成功，再写 header
 	src, err := os.Open(ObjectPath(t.storageDir, f.StorageKey))
 	if err != nil {
-		// 记录还在、磁盘上没了，跳过它，只是少一个文件；总比整个下载失败好。
+		// 记录还在、磁盘上没了，跳过它
 		t.log.Error("打包时跳过打不开的对象",
 			"err", err, "file_id", f.ID, "storage_key", f.StorageKey, "name", f.Name)
 		return nil
@@ -342,7 +333,7 @@ func (t *zipTree) writeFile(_ context.Context, f File, name string) error {
 	defer src.Close()
 
 	hdr := &zip.FileHeader{Name: name, Method: zip.Deflate}
-	// 已经压过的格式再 Deflate 一次基本不省空间。
+	// 已经压过的格式不用再 Deflate
 	if alreadyCompressed(f.Name) {
 		hdr.Method = zip.Store
 	}

@@ -16,14 +16,12 @@ import (
 	"netdisk/pkg/token"
 )
 
-// frontendDir 是前端静态页面目录（相对进程运行目录）。
-// 前端源码在 web/，构建产物输出到 web/dist（cd web && npm run build）。
 const frontendDir = "web/dist"
 
 type Deps struct {
 	DB         *gorm.DB
 	Signer     *token.Signer // 登录凭证的签发/校验器
-	StorageDir string        // 对象存储根目录（来自配置文件）
+	StorageDir string        // 对象存储根目录
 	Logger     *slog.Logger
 }
 
@@ -31,7 +29,6 @@ type Deps struct {
 func New(deps Deps) *echo.Echo {
 	e := echo.New()
 	if deps.Logger != nil {
-		// 请求日志中间件写的是 c.Logger()，也就是 e.Logger，换掉它就够了。
 		e.Logger = deps.Logger
 	}
 
@@ -51,8 +48,7 @@ func New(deps Deps) *echo.Echo {
 	share.RegisterRoutes(api.Group("/shares"), deps.DB, deps.Signer)
 	share.RegisterPublicRoutes(e, deps.DB, deps.StorageDir)
 
-	// 前端页面。用相对路径，和 config.yaml、存储目录的约定一致；
-	// 找不到 web2/dist 构建产物时只提供 API，不影响后端本身。
+	// 前端页面
 	if info, err := os.Stat(frontendDir); err == nil && info.IsDir() {
 		e.Static("/", frontendDir)
 	} else {
