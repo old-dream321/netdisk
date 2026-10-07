@@ -10,20 +10,10 @@
 go run .
 ```
 
-首次启动会在当前目录生成 `config.yaml`（含随机 `auth.secret`）和 `data/` 数据目录。
+首次启动会在当前目录生成 `config.yaml`和 `data/` 数据目录。
 浏览器打开 <http://localhost:8080/> 即可注册使用。
 
-## 前端（React + Ant Design）
-
-源码在 `web/`，构建产物输出到 `web/dist`（后端托管该目录）：
-
-```bash
-cd web
-npm install
-npm run build
-```
-
-开发模式：`npm run dev`（已配置代理到 `http://localhost:8080`，需先启动后端）。
+## 前端（React + Ant Design） 
 前端纯AI编写（显然能看出来）
 
 ## 功能

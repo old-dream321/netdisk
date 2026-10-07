@@ -40,7 +40,7 @@ func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer, storageDir
 	g.PATCH("/:id", update(db)) // 改名 / 移动
 	// 打包下载目录。不注册 HEAD：流式打包给不出 Content-Length，也不支持 Range（边压边发，没法 seek）
 	g.GET("/:id/zip", zipDir(db, storageDir))
-	g.DELETE("/:id", remove(db, storageDir)) // 默认软删除（进回收站），?permanent=true 为彻底删除
+	g.DELETE("/:id", remove(db, storageDir)) // 默认进回收站，?permanent=true 为彻底删除
 	g.POST("/:id/restore", restore(db))      // 从回收站恢复
 }
 
@@ -59,8 +59,6 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return c.JSON(http.StatusRequestEntityTooLarge, map[string]string{"error": "文件超过大小限制"})
 		}
 
-		// 配额预检查放在最前面：此刻还没落盘，被拒时不需要清理任何东西。
-		// 用 header.Size（multipart 解析出来的真实长度）而不是客户端报的数字。
 		if err := user.EnsureCapacity(ctx, db, ownerID, header.Size); err != nil {
 			if errors.Is(err, user.ErrQuotaExceeded) {
 				return c.JSON(http.StatusInsufficientStorage, map[string]string{"error": err.Error()})
@@ -77,7 +75,7 @@ func upload(db *gorm.DB, storageDir string) echo.HandlerFunc {
 			return writeParentCheckError(c, err)
 		}
 
-		// 显式给的名字严格校验
+		// 校验给出的名字
 		name := strings.TrimSpace(c.FormValue("name"))
 		if name == "" {
 			// 没给就取 header.Filename 的最后一段（因为有可能是路径）
@@ -154,7 +152,7 @@ func download(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	}
 }
 
-// 打包下载一个目录（流式，边遍历边压）
+// 打包下载一个目录（流式压缩）
 func zipDir(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
@@ -193,8 +191,8 @@ func zipDir(db *gorm.DB, storageDir string) echo.HandlerFunc {
 // ---------列表，创建文件夹-----------
 
 // 用指针可以区分"没传"和"传了零值"
-// - ParentID 为 nil = 该用户的全部文件；为 0 = 只看根目录；
-// - Status 为 nil = 只看正常文件（1），传 2 就是看回收站。
+// - ParentID 为 nil： 该用户的全部文件；为 0：只看根目录；
+// - Status 为 nil： 只看正常文件（1），传2就是看回收站。
 type listRequest struct {
 	ParentID *uint64 `json:"parent_id"`
 	Status   *int8   `json:"status"`
@@ -452,7 +450,7 @@ func remove(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	}
 }
 
-// restore 把回收站里的条目恢复回正常状态；目录会连同子项一起恢复。
+// 把回收站里的条目恢复回正常状态；目录会连同子项一起恢复。
 func restore(db *gorm.DB) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		ctx := c.Request().Context()
@@ -513,8 +511,8 @@ func restore(db *gorm.DB) echo.HandlerFunc {
 // ---------改名移动-----------
 
 type updateRequest struct {
-	Name     *string `json:"name"`      // nil = 不改名
-	ParentID *uint64 `json:"parent_id"` // nil = 不移动；&0 = 移到根目录
+	Name     *string `json:"name"`
+	ParentID *uint64 `json:"parent_id"`
 }
 
 func update(db *gorm.DB) echo.HandlerFunc {

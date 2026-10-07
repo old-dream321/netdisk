@@ -96,6 +96,7 @@ func SweepTrash(ctx context.Context, db *gorm.DB, storageDir string, ttl time.Du
 			return total, nil
 		}
 
+		// 判断结束
 		select {
 		case <-ctx.Done():
 			return total, ctx.Err()

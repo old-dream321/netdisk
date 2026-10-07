@@ -26,7 +26,6 @@ func RegisterRoutes(g *echo.Group, db *gorm.DB, signer *token.Signer) {
 	g.DELETE("/:id", revoke(db))
 }
 
-// “打开分享链接”的公开路由。
 // 两个路径都要注册：`/s/:token` 匹配根自己，`/s/:token/*` 匹配子路径
 func RegisterPublicRoutes(e *echo.Echo, db *gorm.DB, storageDir string) {
 	h := serve(db, storageDir)
@@ -121,8 +120,6 @@ func serve(db *gorm.DB, storageDir string) echo.HandlerFunc {
 		// 下载走同一个路径，只是多一个开关
 		if c.QueryParam("download") == "1" {
 			if res.Target.Type != file.TypeFile {
-				// 目录：流式打包成 zip。打包逻辑和 /api/files/:id/zip 共用，
-				// 包括"开始写之后失败只能掐断连接"那套约定。
 				wrote, err := file.StreamZipDir(c, db, res.Share.OwnerID, res.Target, storageDir)
 				if err != nil {
 					if wrote {
@@ -151,7 +148,7 @@ func serve(db *gorm.DB, storageDir string) echo.HandlerFunc {
 	}
 }
 
-// viewDir 列出目录内容。形状和 files/list 保持一致（items/count/limit/offset）。
+// 列出目录内容
 func viewDir(c *echo.Context, db *gorm.DB, res resolved) error {
 	ctx := c.Request().Context()
 
