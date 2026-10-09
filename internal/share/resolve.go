@@ -117,8 +117,7 @@ func splitSubpath(raw string) ([]string, error) {
 	return segs, nil
 }
 
-// 拼出某个位置的下载地址。
-// 逐段转义：名字里的空格、#、? 不转义就会拼出一个坏 URL。
+// 拼出某个位置的下载地址，逐段转义
 func downloadURL(token string, path []string) string {
 	if len(path) == 0 {
 		return "/s/" + token + "?download=1"

@@ -3,7 +3,6 @@
 *.db
 /data
 
-# 运行时生成（config.yaml 里以后可能写数据库密码，不进仓库）
 /config.yaml
 /sessions.json
 /storage
